@@ -1,0 +1,28 @@
+# ⚠️ Secrets — NE JAMAIS COMMITER
+.env
+*.env
+.env.local
+.env.production
+
+# Données persistantes n8n
+n8n_data/
+files/
+
+# Node.js
+node_modules/
+npm-debug.log*
+
+# WhatsApp session locale (stockée dans Neon sur Koyeb)
+whatsapp_auth/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Temporaires
+*.tmp
+*.bak
