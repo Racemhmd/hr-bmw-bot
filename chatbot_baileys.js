@@ -81,42 +81,112 @@ function detectMetric(t) {
   return 'total_abs';
 }
 
-function detectProcess(t) {
-  if (/assembly|assemblage|montage/.test(t)) return 'ASSEMBLY';
-  if (/press|presse/.test(t)) return 'PRESS';
-  if (/body|caisse/.test(t)) return 'BODY';
-  if (/paint|peinture/.test(t)) return 'PAINT';
-  if (/logistic|logistique/.test(t)) return 'LOGISTIC';
-  if (/quality|qualité/.test(t)) return 'QUALITY';
-  if (/maintenance/.test(t)) return 'MAINTENANCE';
+// Noms de process exacts (tels que stockés dans la colonne process)
+const PROCESS_NAMES = [
+  'assembly','electrical test','electrical','bak','paint','press',
+  'body','logistic','maintenance','quality','trim','chassis','engine',
+  'final','pre-delivery','pdi','audit'
+];
+// Noms de circuits (colonne circuit/segment)
+const CIRCUIT_NAMES = ['pgtf','shelf','wpa','line','assy','test'];
+
+function detectProcessName(t) {
+  if (/electrical[\s-]?test|elec[\s-]?test/.test(t)) return 'electrical test';
+  if (/\bassembly\b|assemblage|montage/.test(t)) return 'assembly';
+  if (/\bbak\b/.test(t)) return 'bak';
+  if (/paint|peinture/.test(t)) return 'paint';
+  if (/\bpress\b|presse/.test(t)) return 'press';
+  if (/body|caisse/.test(t)) return 'body';
+  if (/logistic|logistique/.test(t)) return 'logistic';
+  if (/maintenance/.test(t)) return 'maintenance';
+  if (/quality|qualité/.test(t)) return 'quality';
+  if (/trim/.test(t)) return 'trim';
+  if (/chassis/.test(t)) return 'chassis';
+  if (/engine|moteur/.test(t)) return 'engine';
+  if (/final/.test(t)) return 'final';
+  return null;
+}
+
+function detectCircuitName(t) {
+  if (/\bpgtf\b/.test(t)) return 'pgtf';
+  if (/\bshelf\b/.test(t)) return 'shelf';
+  if (/\bwpa\b/.test(t)) return 'wpa';
   return null;
 }
 
 function detectScope(t) {
   const g = t.match(/\b(g[-.]?\d{3,4})\b/i);
-  const process = detectProcess(t);
-  if (g) return { type: 'group_name', value: g[0].replace(/[\s.]/g,'-').toUpperCase(), process };
-  return { type: 'plant', value: 'BMW U11', process };
+  const procName = detectProcessName(t);
+  const circName = detectCircuitName(t);
+
+  if (g && procName) {
+    // Groupe + process → filtre combiné
+    return { type: 'group_name', value: g[0].replace(/[\s.]/g,'-').toUpperCase(), process: procName, circuit: null };
+  }
+  if (g) {
+    return { type: 'group_name', value: g[0].replace(/[\s.]/g,'-').toUpperCase(), process: null, circuit: null };
+  }
+  if (procName && !g) {
+    // Process seul → scope = process (toute la plant filtrée par process)
+    return { type: 'process', value: procName, process: procName, circuit: null };
+  }
+  if (circName) {
+    return { type: 'circuit', value: circName, process: null, circuit: circName };
+  }
+  return { type: 'plant', value: 'BMW U11', process: null, circuit: null };
+}
+
+function detectTwoDates(t) {
+  const found = [];
+  const dmyRe = /(\d{1,2})[/\-](\d{1,2})(?:[/\-](\d{4}))?/g;
+  let m;
+  while ((m = dmyRe.exec(t)) !== null) {
+    const y = m[3] || String(new Date().getFullYear());
+    found.push(`${y}-${m[2].padStart(2,'0')}-${m[1].padStart(2,'0')}`);
+  }
+  const isoRe = /(\d{4}-\d{2}-\d{2})/g;
+  while ((m = isoRe.exec(t)) !== null) {
+    if (!found.includes(m[1])) found.push(m[1]);
+  }
+  if (found.length >= 2) return { date1: found[0], date2: found[1] };
+  return null;
 }
 
 function detectIntent(t, metric) {
   if (metric === 'summary') return 'get_summary';
   if (/top|classement|le plus|plus.*abs/.test(t)) return 'top';
+  if (/compar|évolution|evolution|vs\b|entre.*et|n-1|jour.*(précédent|avant)/.test(t)) return 'compare';
   return 'get_metric';
 }
 
 // ── SQL Builder ──────────────────────────────────────────────────
-function buildSQL(nlp) {
-  const { metric, scope_type, scope_value, scope_process, date_mode, date, intent } = nlp;
-  let dateExpr;
-  if (date_mode === 'specific' && date) dateExpr = `'${date}'::date`;
-  else if (date_mode === 'today') dateExpr = 'CURRENT_DATE';
-  else if (date_mode === 'yesterday') dateExpr = "CURRENT_DATE - INTERVAL '1 day'";
-  else dateExpr = '(SELECT MAX(report_date) FROM daily_hr_report)';
+function dateExprSQL(date_mode, date) {
+  if (date_mode === 'specific' && date) return `'${date}'::date`;
+  if (date_mode === 'yesterday') return "CURRENT_DATE - INTERVAL '1 day'";
+  return '(SELECT MAX(report_date) FROM daily_hr_report)';
+}
 
-  const col = scope_type === 'group_name' ? 'group_name' : 'plant';
-  let filter = `${col} ILIKE '${scope_value.replace(/'/g,"''")}'`;
-  if (scope_process) filter += ` AND process ILIKE '${scope_process.replace(/'/g,"''")}'`;
+function buildSQL(nlp) {
+  const { metric, scope_type, scope_value, scope_process, scope_circuit, date_mode, date, intent } = nlp;
+  const dateExpr = dateExprSQL(date_mode, date);
+
+  // Déterminer colonne de groupement et filtre selon scope_type
+  let col, filter;
+  if (scope_type === 'group_name') {
+    col = 'group_name';
+    filter = `group_name ILIKE '${scope_value.replace(/'/g,"''")}'`;
+    if (scope_process) filter += ` AND process ILIKE '${scope_process.replace(/'/g,"''")}'`;
+  } else if (scope_type === 'process') {
+    col = 'process';
+    filter = `plant ILIKE 'BMW U11' AND process ILIKE '${scope_value.replace(/'/g,"''")}'`;
+  } else if (scope_type === 'circuit') {
+    col = 'circuit';
+    filter = `plant ILIKE 'BMW U11' AND circuit ILIKE '${scope_value.replace(/'/g,"''")}'`;
+  } else {
+    col = 'plant';
+    filter = `plant ILIKE 'BMW U11'`;
+    if (scope_process) filter += ` AND process ILIKE '${scope_process.replace(/'/g,"''")}'`;
+  }
 
   if (intent === 'get_summary') {
     return `SELECT report_date, ${col} AS scope_label,
@@ -165,6 +235,62 @@ function fmtDate(d) {
   if (!d) return 'N/D';
   try { return new Date(d).toLocaleDateString('fr-TN',{day:'2-digit',month:'2-digit',year:'numeric'}); }
   catch(e) { return String(d); }
+}
+
+function aggRows(rows) {
+  if (!rows || rows.length === 0) return null;
+  const a = rows.reduce((acc, r) => {
+    ['actif','present','p','np','sq','ac','rv','ml','md','maladie','mise_en_demeure','total_abs','retard','heures_sup','heures_presence'].forEach(k => { acc[k]=(acc[k]||0)+(parseFloat(r[k])||0); });
+    acc.report_date = r.report_date; return acc;
+  }, {});
+  a.abs_np_rate   = a.actif ? Math.round(a.np/a.actif*10000)/100 : 0;
+  a.abs_p_rate    = a.actif ? Math.round(a.p/a.actif*10000)/100 : 0;
+  a.taux_presence = a.actif ? Math.round(a.present/a.actif*10000)/100 : 0;
+  a.maladie = a.ml; a.mise_en_demeure = a.md;
+  return a;
+}
+
+function formatComparison(rows1, rows2, dates, metric, scope, lang) {
+  const a1 = aggRows(rows1);
+  const a2 = aggRows(rows2);
+  const d1 = fmtDate(dates.date1);
+  const d2 = fmtDate(dates.date2);
+
+  const getVal = (a, m) => {
+    if (!a) return null;
+    const map = { np:'np', p:'p', sq:'sq', ac:'ac', rv:'rv', maladie:'maladie', mise_en_demeure:'mise_en_demeure',
+      abs_np_rate:'abs_np_rate', abs_p_rate:'abs_p_rate', taux_presence:'taux_presence',
+      total_abs:'total_abs', actif:'actif', present:'present', heures_sup:'heures_sup',
+      retard:'retard', heures_presence:'heures_presence' };
+    return a[map[m] || 'total_abs'];
+  };
+
+  const v1 = getVal(a1, metric);
+  const v2 = getVal(a2, metric);
+  const isPct = ['abs_np_rate','abs_p_rate','taux_presence'].includes(metric);
+  const unit = isPct ? '%' : '';
+  const diff = (v2 != null && v1 != null) ? v2 - v1 : null;
+  const arrow = diff == null ? '➡️' : diff > 0 ? '📈' : diff < 0 ? '📉' : '➡️';
+  const sign = diff >= 0 ? '+' : '';
+
+  const metricLabel = {
+    np:'NP', p:'P', sq:'SQ', ac:'AC', rv:'RV', maladie:'ML (Maladie Prol.)',
+    mise_en_demeure:'MD (Mise en demeure)', abs_np_rate:'Taux NP', abs_p_rate:'Taux P',
+    taux_presence:'Taux Présence', total_abs:'Total Abs', actif:'Effectif Actif',
+    present:'Présents', heures_sup:'H.Sup', retard:'Retard', heures_presence:'H.Présence'
+  }[metric] || metric.toUpperCase();
+
+  if (lang === 'ar') {
+    return `📊 *مقارنة — ${scope}*\n\n` +
+      `📅 ${d1} → ${v1 != null ? fmt(v1) + unit : 'N/D'}\n` +
+      `📅 ${d2} → ${v2 != null ? fmt(v2) + unit : 'N/D'}\n\n` +
+      `${arrow} ${diff != null ? sign + fmt(diff) + unit : 'N/D'}`;
+  }
+  return `📊 *Comparaison ${metricLabel} — ${scope}*\n\n` +
+    `📅 ${d1} : *${v1 != null ? fmt(v1) + unit : 'N/D'}*\n` +
+    `📅 ${d2} : *${v2 != null ? fmt(v2) + unit : 'N/D'}*\n\n` +
+    `${arrow} Évolution : ${diff != null ? sign + fmt(diff) + unit : 'N/D'}` +
+    (a1 ? `\n👥 Actif : ${fmt(a1.actif||0,0)} → ${fmt(a2?.actif||0,0)}` : '');
 }
 
 function formatResponse(rows, nlp) {
@@ -263,8 +389,40 @@ async function processMessage(sock, jid, text) {
   let   scope  = detectScope(t);
   const intent = detectIntent(t, metric);
 
-  const nlp = { metric, intent, language: lang, scope_type: scope.type, scope_value: scope.value, scope_process: scope.process||null, date_mode: date.mode, date: date.date };
-  console.log(`   📊 NLP: ${intent} | ${metric} | ${scope.value} | ${date.mode} | ${lang}`);
+  console.log(`   📊 NLP: ${intent} | ${metric} | ${scope.type}:${scope.value} | ${date.mode} | ${lang}`);
+
+  // ── Comparaison deux dates ─────────────────────────────────────
+  if (intent === 'compare') {
+    const twoDates = detectTwoDates(t);
+    const scopeLabel = scope.type === 'process' ? scope.value.toUpperCase()
+                     : scope.type === 'circuit' ? scope.value.toUpperCase()
+                     : scope.value;
+    if (twoDates) {
+      const nlp1 = { metric, intent:'get_metric', language:lang, scope_type:scope.type, scope_value:scope.value, scope_process:scope.process, scope_circuit:scope.circuit, date_mode:'specific', date:twoDates.date1 };
+      const nlp2 = { metric, intent:'get_metric', language:lang, scope_type:scope.type, scope_value:scope.value, scope_process:scope.process, scope_circuit:scope.circuit, date_mode:'specific', date:twoDates.date2 };
+      const [rows1, rows2] = await Promise.all([dbQuery(buildSQL(nlp1)), dbQuery(buildSQL(nlp2))]);
+      const response = formatComparison(rows1, rows2, twoDates, metric, scopeLabel, lang);
+      await sock.sendMessage(jid, { text: response });
+      console.log(`   ✅ Comparaison envoyée`);
+      return;
+    } else {
+      // Comparer dernière date vs avant-dernière
+      const datesRows = await dbQuery(`SELECT DISTINCT report_date FROM daily_hr_report WHERE plant ILIKE 'BMW U11' ORDER BY report_date DESC LIMIT 2`);
+      if (datesRows.length >= 2) {
+        const d1 = datesRows[1].report_date.toISOString().slice(0,10);
+        const d2 = datesRows[0].report_date.toISOString().slice(0,10);
+        const nlp1 = { metric, intent:'get_metric', language:lang, scope_type:scope.type, scope_value:scope.value, scope_process:scope.process, scope_circuit:scope.circuit, date_mode:'specific', date:d1 };
+        const nlp2 = { metric, intent:'get_metric', language:lang, scope_type:scope.type, scope_value:scope.value, scope_process:scope.process, scope_circuit:scope.circuit, date_mode:'specific', date:d2 };
+        const [rows1, rows2] = await Promise.all([dbQuery(buildSQL(nlp1)), dbQuery(buildSQL(nlp2))]);
+        const response = formatComparison(rows1, rows2, { date1:d1, date2:d2 }, metric, scopeLabel, lang);
+        await sock.sendMessage(jid, { text: response });
+        console.log(`   ✅ Comparaison J/J-1 envoyée`);
+        return;
+      }
+    }
+  }
+
+  const nlp = { metric, intent, language: lang, scope_type: scope.type, scope_value: scope.value, scope_process: scope.process||null, scope_circuit: scope.circuit||null, date_mode: date.mode, date: date.date };
 
   // SQL + réponse
   const sql  = buildSQL(nlp);
