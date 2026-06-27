@@ -152,10 +152,16 @@ function detectTwoDates(t) {
 
 function detectIntent(t, metric) {
   if (metric === 'summary') return 'get_summary';
+  if (/best\s*employ|أفضل\s*عامل|meilleur.*employ|critère.*best|best.*critère/.test(t)) return 'best_employee';
+  if (/best\s*team|أفضل\s*فريق|meilleur.*équipe|best.*team.*critère|critère.*best.*team/.test(t)) return 'best_team';
   if (/top|classement|le plus|plus.*abs/.test(t)) return 'top';
   if (/compar|évolution|evolution|vs\b|entre.*et|n-1|jour.*(précédent|avant)/.test(t)) return 'compare';
+  // "groupes de Shelf/WPA/Basis/PGTF" → list groupes filtrés par circuit
+  if (/groupe.*de\s+(shelf|wpa|basis|pgtf)|les\s+groupe.*\b(shelf|wpa|basis|pgtf)\b/.test(t)) return 'list_group';
   if (/chaque\s+groupe|tous\s+les\s+groupe|par\s+groupe|each\s+group/.test(t)) return 'list_group';
   if (/chaque\s+(area|ho)|par\s+(area|ho)|tous\s+les\s+(area|ho)/.test(t)) return 'list_area';
+  // "par PGTF" avec détail → list circuits filtrés PGTF
+  if (/par\s+pgtf|pgtf.*(1.*2|2.*3|breakdown|détail)/.test(t)) return 'list_circuit';
   if (/chaque\s+(process|circuit)|par\s+(process|circuit)/.test(t)) return 'list_circuit';
   return 'get_metric';
 }
@@ -216,8 +222,16 @@ function buildSQL(nlp) {
       delta:'SUM(soll) AS soll, SUM(ist) AS ist, ROUND(SUM(ist)-SUM(soll),2) AS value',
     };
     const listSel = metricColMap[metric] || 'SUM(total_abs) AS value, SUM(np) AS np, SUM(p) AS p';
+    // Filtre circuit/process optionnel pour list_group (ex: groupes de Shelf)
+    let listFilter = `plant ILIKE 'BMW U11'`;
+    if (scope_circuit && (intent === 'list_group' || intent === 'list_circuit')) {
+      listFilter += ` AND circuit ILIKE '${safe(scope_circuit)}'`;
+    }
+    if (scope_process && intent === 'list_group') {
+      listFilter += ` AND process ILIKE '${safe(scope_process)}'`;
+    }
     return `SELECT ${listCol} AS scope_label, ${listSel}
-      FROM daily_hr_report WHERE report_date = ${dateExpr} AND plant ILIKE 'BMW U11'
+      FROM daily_hr_report WHERE report_date = ${dateExpr} AND ${listFilter}
       GROUP BY ${listCol} ORDER BY value DESC NULLS LAST LIMIT 30`;
   }
 
@@ -463,6 +477,57 @@ async function processMessage(sock, jid, text) {
   const intent = detectIntent(t, metric);
 
   console.log(`   📊 NLP: ${intent} | ${metric} | ${scope.type}:${scope.value} | ${date.mode} | ${lang}`);
+
+  // ── Best Employee / Best Team ──────────────────────────────────
+  if (intent === 'best_employee') {
+    const msg = `🏆 *Critères Best Employee — BMW U11*\n\n` +
+      `*🥇 Meilleur Employé du Mois (Unité) :*\n` +
+      `✅ Conditions NON éliminatoires :\n` +
+      `  • Polyvalence\n` +
+      `  • ≥ 2 idées dans le système d'amélioration continue\n` +
+      `  • Objectifs Efficience atteints\n` +
+      `  • Objectifs Qualité atteints\n\n` +
+      `❌ Conditions éliminatoires :\n` +
+      `  • Absence non justifiée\n` +
+      `  • ≥ 1 absence justifiée\n` +
+      `  • Retard\n` +
+      `  • Sanction disciplinaire\n` +
+      `  • Ancienneté < 3 mois\n` +
+      `  • Oubli de pointage\n\n` +
+      `*🥇 Meilleur Employé de l'Année — Leoni Tunisie :*\n` +
+      `✅ Conditions NON éliminatoires :\n` +
+      `  • Polyvalence\n` +
+      `  • ≥ 3 idées amélioration continue\n` +
+      `  • Objectifs Efficience atteints\n` +
+      `  • Objectifs Qualité atteints\n\n` +
+      `❌ Conditions éliminatoires :\n` +
+      `  • Absence non justifiée\n` +
+      `  • ≥ 4 absences justifiées\n` +
+      `  • ≥ 3 retards\n` +
+      `  • Sanction disciplinaire\n` +
+      `  • Ancienneté < 1 an\n` +
+      `  • ≥ 2 oublis de pointage`;
+    await sock.sendMessage(jid, { text: msg });
+    return;
+  }
+
+  if (intent === 'best_team') {
+    const msg = `🏆 *Critères Best Team — BMW U11*\n\n` +
+      `Les mêmes critères que Best Employee s'appliquent à l'équipe :\n\n` +
+      `✅ Performance collective :\n` +
+      `  • Taux de présence élevé\n` +
+      `  • Zéro absence NP dans l'équipe\n` +
+      `  • Objectifs Qualité & Efficience atteints\n` +
+      `  • Participation aux idées d'amélioration\n\n` +
+      `❌ Éliminatoires équipe :\n` +
+      `  • Absence non justifiée dans l'équipe\n` +
+      `  • Sanction disciplinaire membre\n` +
+      `  • Objectifs non atteints\n\n` +
+      `Pour consulter les données de présence d'un groupe :\n` +
+      `_Ex: résumé G-852_`;
+    await sock.sendMessage(jid, { text: msg });
+    return;
+  }
 
   // ── Comparaison deux dates ─────────────────────────────────────
   if (intent === 'compare') {
