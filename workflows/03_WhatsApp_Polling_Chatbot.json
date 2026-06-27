@@ -1,0 +1,238 @@
+{
+  "name": "WhatsApp HR BMW U11 — Polling",
+  "id": "7cd5e9f0-a134-4h78-c345-0h2ef1g34567",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [{"field": "minutes", "minutesInterval": 1}]
+        }
+      },
+      "id": "p001",
+      "name": "⏰ Polling 1 min",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [0, 300]
+    },
+    {
+      "parameters": {
+        "url": "https://7107.api.greenapi.com/waInstance7107665040/receiveNotification/c550d04c1dde4c11af75f8a7fd04a0bb633108512ec34e8bba",
+        "options": {}
+      },
+      "id": "p002",
+      "name": "📥 Recevoir Notification",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [250, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Polling Green API — receiveNotification\nconst notif = $input.first().json;\n\n// Pas de notification en attente → stop silencieusement\nif (!notif || !notif.receiptId) return [];\n\nconst body = notif.body || {};\nconst typeWebhook = body.typeWebhook || '';\nconst isIncoming = typeWebhook === 'incomingMessageReceived';\nconst isOutgoing = typeWebhook === 'outgoingMessageReceived';\n\n// Ignorer les webhooks non-texte (status, device, etc.)\nif (!isIncoming && !isOutgoing) return [];\n\nconst msgData    = body.messageData || {};\nconst textMsg    = msgData.textMessageData || msgData.extendedTextMessageData || {};\nconst senderData = body.senderData || {};\n\nconst message = (textMsg.textMessage || textMsg.text || '').trim();\nif (!message) return [];\n\nconst chatId = senderData.chatId || senderData.sender || '';\nconst rawPhone = isIncoming ? (senderData.sender || '') : (senderData.chatId || '');\nconst phone = rawPhone.replace('@c.us','').replace(/\\D/g,'');\nif (!phone) return [];\n\n// Anti-boucle : ignorer les réponses du bot\nconst BOT_PREFIXES = ['📊','✅','❌','🤖','📅','⚠️','🏥','🗓️','👥','🎯','⏰','⏱️','⚖️','🏆'];\nif (isOutgoing && BOT_PREFIXES.some(p => message.startsWith(p))) return [];\n\nreturn [{ json: {\n  phone_number: '+' + phone,\n  chat_id: chatId,\n  message_text: message,\n  message_id: msgData.idMessage || body.idMessage || '',\n  timestamp: body.timestamp || Date.now(),\n  receiptId: notif.receiptId\n}}];"
+      },
+      "id": "p003",
+      "name": "Extraire Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [500, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT phone_number, full_name, role, allowed_scope_type, allowed_scope_value, language_pref FROM allowed_whatsapp_users WHERE phone_number = '{{ $json.phone_number }}' AND is_active = TRUE LIMIT 1;",
+        "options": {}
+      },
+      "id": "p004",
+      "name": "Vérifier Utilisateur",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [750, 300],
+      "credentials": {
+        "postgres": {
+          "id": "NEON_CRED_ID",
+          "name": "Neon PostgreSQL - HR BMW U11"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const msgData = $('Extraire Message').first().json;\nconst dbRows = $input.all();\nconst user = dbRows.length > 0 && dbRows[0].json?.phone_number ? dbRows[0].json : null;\n\nif (!user) {\n  return [{ json: { ...msgData, authorized: false, user_role: null, allowed_scope_type: null, allowed_scope_value: null } }];\n}\nreturn [{ json: {\n  ...msgData,\n  authorized: true,\n  user_role: user.role,\n  user_name: user.full_name,\n  allowed_scope_type: user.allowed_scope_type,\n  allowed_scope_value: user.allowed_scope_value,\n  language_pref: user.language_pref || 'fr'\n}}];"
+      },
+      "id": "p005",
+      "name": "Résultat Auth",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1000, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "conditions": [{
+            "leftValue": "={{ $json.authorized }}",
+            "rightValue": true,
+            "operator": {"type": "boolean", "operation": "true"}
+          }]
+        }
+      },
+      "id": "p006",
+      "name": "Autorisé ?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1250, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// NLP AVANCÉ — Détection langue + intent + métrique + scope\n// ⚠️  ML = Maladie | MD = Mise en demeure | SÉPARÉS\n// ============================================================\nconst data = $input.first().json;\nconst rawText = data.message_text || '';\nconst t = rawText.toLowerCase().trim();\n\nconst ALLOWED_METRICS = new Set([\n  'actif','present','nb_abs','p','np','sq','ac','rv',\n  'ml','md','maladie','mise_en_demeure',\n  'abs_p_rate','abs_np_rate','total_abs','taux_presence',\n  'heures_presence','retard','heures_sup','soll','ist','delta'\n]);\n\nfunction detectLang(t) {\n  if (/[\\u0600-\\u06FF]/.test(t)) return 'ar';\n  const tn = ['a3tini','9adech','chnowa','chkoun','mta3','lyoum','fi ','barsha','waqteh','chbih','akther','fih','bech','3andek','ma3ndich'];\n  if (tn.some(w => t.includes(w))) return 'tn';\n  return 'fr';\n}\n\nfunction detectDate(t) {\n  const iso = t.match(/(\\d{4}-\\d{2}-\\d{2})/);\n  if (iso) return { mode: 'specific', date: iso[0] };\n  const dmy = t.match(/(\\d{1,2})[/\\-](\\d{1,2})[/\\-](\\d{4})/);\n  if (dmy) return { mode: 'specific', date: `${dmy[3]}-${dmy[2].padStart(2,'0')}-${dmy[1].padStart(2,'0')}` };\n  if (/aujourd|lyoum|اليوم|today/.test(t)) return { mode: 'today', date: null };\n  if (/hier|امس|yesterday/.test(t)) return { mode: 'yesterday', date: null };\n  return { mode: 'latest', date: null };\n}\n\nfunction detectMetric(t) {\n  if (/taux.*np|pourcentage.*np|%.*np|نسبة.*np|chnowa.*np|taux abs np|abs np rate/.test(t)) return 'abs_np_rate';\n  if (/taux.*\\bp\\b|pourcentage.*\\bp\\b|%.*\\bp\\b|taux abs p|abs p rate/.test(t)) return 'abs_p_rate';\n  if (/taux.*pré|taux.*presence|نسبة.*حضور|taux presence/.test(t)) return 'taux_presence';\n  if (/\\bnp\\b|absence np|abs np|non plan|غياب.*غير|ghiyeb non/.test(t)) return 'np';\n  if (/\\bp\\b|absence planif|abs p|غياب.*مخطط/.test(t) && !/np/.test(t)) return 'p';\n  if (/\\bsq\\b|sans questionnaire|sans quest/.test(t)) return 'sq';\n  if (/\\bac\\b|absence continue|abs continue/.test(t)) return 'ac';\n  if (/\\brv\\b|rendez.vous|رnd/.test(t)) return 'rv';\n  if (/\\bml\\b|maladie(?! légale.*md)|maladies(?! légale.*md)|مرض|maradh|nombre.*malad|malad/.test(t) && !/mise en demeure|\\bmd\\b/.test(t)) return 'maladie';\n  if (/\\bmd\\b|mise en demeure/.test(t)) return 'mise_en_demeure';\n  if (/\\bdelta\\b|soll.*ist|ist.*soll|écart/.test(t)) return 'delta';\n  if (/\\bsoll\\b|planifié h/.test(t) && !/ist/.test(t)) return 'soll';\n  if (/\\bist\\b|heures réelles/.test(t) && !/soll/.test(t)) return 'ist';\n  if (/h.*sup|heures sup|hsup|heures supplémentaires/.test(t)) return 'heures_sup';\n  if (/retard|تأخر/.test(t)) return 'retard';\n  if (/actif|effectif|workforce/.test(t) && !/total|absence/.test(t)) return 'actif';\n  if (/présent|present|حاضر/.test(t) && !/taux/.test(t)) return 'present';\n  if (/résumé|resume|ملخص|tous.*indicateurs|all.*indicator|chiffres/.test(t)) return 'summary';\n  if (/total.*abs|nombre.*abs|combien.*abs|9adech.*abs|قداش.*غياب/.test(t)) return 'total_abs';\n  return 'total_abs';\n}\n\nfunction detectScope(t, userRole, scopeType, scopeVal) {\n  const gMatch = t.match(/\\b(g[-.]?\\d{3,4}|g\\s\\d{3,4})\\b/i);\n  if (gMatch) return { type: 'group_name', value: gMatch[0].replace(/[\\s.]/g,'-').toUpperCase() };\n  const perims = ['pgtf','wpa','shelf modulaire','basis','muster','logistique','logistics','quality','maintenance'];\n  for (const p of perims) if (t.includes(p)) return { type: 'perimeter', value: p.toUpperCase() };\n  const procs = ['assembly','assemblage','montage','test','paint','peinture','body','karosserie','trim','chassis'];\n  for (const p of procs) if (t.includes(p)) return { type: 'process', value: p.charAt(0).toUpperCase()+p.slice(1) };\n  const cMatch = t.match(/\\b(circuit\\s*)?(c\\d{1,2})\\b/i);\n  if (cMatch) return { type: 'circuit', value: cMatch[cMatch.length-1].toUpperCase() };\n  const aMatch = t.match(/area\\s+([\\w-]+)|zone\\s+([\\w-]+)/);\n  if (aMatch) return { type: 'area', value: (aMatch[1]||aMatch[2]).toUpperCase() };\n  if (/bmw u11|plant|مصنع|الكل|tout le plant/.test(t)) return { type: 'plant', value: 'BMW U11' };\n  if (userRole === 'supervisor' && scopeType && scopeVal) return { type: scopeType, value: scopeVal };\n  return { type: 'plant', value: 'BMW U11' };\n}\n\nfunction detectIntent(t, metric) {\n  if (metric === 'summary') return 'get_summary';\n  if (/compare|vs\\b|versus|بالمقارنة|compare.*entre/.test(t)) return 'compare';\n  if (/plus.*abs|akther.*fih|أكثر.*غياب|le plus|top|classement/.test(t)) return 'top';\n  return 'get_metric';\n}\n\nconst lang = detectLang(t);\nconst dateInfo = detectDate(t);\nconst metric = detectMetric(t);\nconst scope = detectScope(t, data.user_role, data.allowed_scope_type, data.allowed_scope_value);\nconst intent = detectIntent(t, metric);\nconst safeMetric = (metric === 'summary') ? 'summary' : (ALLOWED_METRICS.has(metric) ? metric : 'total_abs');\n\nreturn [{ json: {\n  ...data,\n  nlp: {\n    language: lang, intent,\n    metric: safeMetric, metric_raw: metric,\n    scope_type: scope.type, scope_value: scope.value,\n    date_mode: dateInfo.mode, date: dateInfo.date,\n    raw_text: rawText\n  }\n}}];"
+      },
+      "id": "p007",
+      "name": "NLP — Analyse Question",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1500, 200]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// CONSTRUCTION REQUÊTE SQL SÉCURISÉE\n// ⚠️  ML = Maladie | MD = Mise en demeure | SÉPARÉS\n// ============================================================\nconst data = $input.first().json;\nconst nlp = data.nlp;\nconst userRole = data.user_role;\nconst userScopeType = data.allowed_scope_type;\nconst userScopeValue = data.allowed_scope_value;\n\nfunction resolveDate(mode, dateVal) {\n  if (mode === 'specific' && dateVal) return `'${dateVal}'::date`;\n  if (mode === 'today') return 'CURRENT_DATE';\n  if (mode === 'yesterday') return 'CURRENT_DATE - INTERVAL \\'1 day\\'';\n  return '(SELECT MAX(report_date) FROM daily_hr_report)';\n}\nconst dateExpr = resolveDate(nlp.date_mode, nlp.date);\n\nfunction getScopeFilter(scopeType, scopeValue, userRole, userScopeType, userScopeValue) {\n  let type = scopeType; let val = scopeValue;\n  if (userRole === 'supervisor' && userScopeType && userScopeValue) {\n    if (type === 'plant' || type === 'all') { type = userScopeType; val = userScopeValue; }\n    else if (type !== userScopeType || val.toUpperCase() !== userScopeValue.toUpperCase()) {\n      return { filter: `1=0`, scopeLabel: 'Non autorisé' };\n    }\n  }\n  const colMap = { 'group_name':'group_name','perimeter':'perimeter','process':'process','circuit':'circuit','area':'area','plant':'plant' };\n  const col = colMap[type] || 'plant';\n  if (type === 'plant') return { filter: `plant ILIKE '${val.replace(/'/g,\"''\")}' `, scopeLabel: val };\n  return { filter: `${col} ILIKE '%${val.replace(/'/g,\"''\")}%'`, scopeLabel: val };\n}\n\nconst scopeCols = { 'plant':'plant','perimeter':'perimeter','process':'process','circuit':'circuit','group_name':'group_name','area':'area' };\nconst groupCol = scopeCols[nlp.scope_type] || 'plant';\nconst { filter, scopeLabel } = getScopeFilter(nlp.scope_type, nlp.scope_value, userRole, userScopeType, userScopeValue);\n\nlet query = '';\n\nif (nlp.intent === 'get_summary') {\n  query = `SELECT report_date, ${groupCol} AS scope_label, SUM(actif) AS actif, SUM(present) AS present, SUM(nb_abs) AS nb_abs, SUM(p) AS p, SUM(np) AS np, SUM(sq) AS sq, SUM(ac) AS ac, SUM(rv) AS rv, SUM(ml) AS maladie, SUM(md) AS mise_en_demeure, SUM(total_abs) AS total_abs, ROUND(SUM(np)/NULLIF(SUM(actif),0)*100,2) AS abs_np_rate, ROUND(SUM(p)/NULLIF(SUM(actif),0)*100,2) AS abs_p_rate, ROUND(SUM(present)/NULLIF(SUM(actif),0)*100,2) AS taux_presence, SUM(retard) AS retard, SUM(heures_sup) AS heures_sup, SUM(soll) AS soll, SUM(ist) AS ist, ROUND(SUM(ist)-SUM(soll),2) AS delta FROM daily_hr_report WHERE report_date = ${dateExpr} AND ${filter} GROUP BY report_date, ${groupCol};`;\n} else if (nlp.intent === 'top') {\n  const metric = nlp.metric === 'maladie' ? 'ml' : nlp.metric === 'mise_en_demeure' ? 'md' : nlp.metric;\n  const safeM = /^[a-z_]+$/.test(metric) ? metric : 'np';\n  query = `SELECT report_date, ${groupCol} AS scope_label, SUM(${safeM}) AS value, SUM(actif) AS actif FROM daily_hr_report WHERE report_date = ${dateExpr} AND ${filter} GROUP BY report_date, ${groupCol} ORDER BY value DESC NULLS LAST LIMIT 5;`;\n} else {\n  const metricColMap = {\n    'actif': 'SUM(actif) AS actif',\n    'present': 'SUM(present) AS present',\n    'nb_abs': 'SUM(nb_abs) AS nb_abs',\n    'p': 'SUM(p) AS p, SUM(actif) AS actif, ROUND(SUM(p)/NULLIF(SUM(actif),0)*100,2) AS abs_p_rate',\n    'np': 'SUM(np) AS np, SUM(actif) AS actif, ROUND(SUM(np)/NULLIF(SUM(actif),0)*100,2) AS abs_np_rate',\n    'sq': 'SUM(sq) AS sq',\n    'ac': 'SUM(ac) AS ac',\n    'rv': 'SUM(rv) AS rv',\n    'ml': 'SUM(ml) AS maladie',\n    'maladie': 'SUM(ml) AS maladie',\n    'md': 'SUM(md) AS mise_en_demeure',\n    'mise_en_demeure': 'SUM(md) AS mise_en_demeure',\n    'abs_np_rate': 'SUM(np) AS np, SUM(actif) AS actif, ROUND(SUM(np)/NULLIF(SUM(actif),0)*100,2) AS abs_np_rate',\n    'abs_p_rate': 'SUM(p) AS p, SUM(actif) AS actif, ROUND(SUM(p)/NULLIF(SUM(actif),0)*100,2) AS abs_p_rate',\n    'total_abs': 'SUM(total_abs) AS total_abs, SUM(p) AS p, SUM(np) AS np',\n    'taux_presence': 'SUM(present) AS present, SUM(actif) AS actif, ROUND(SUM(present)/NULLIF(SUM(actif),0)*100,2) AS taux_presence',\n    'heures_presence': 'SUM(heures_presence) AS heures_presence',\n    'retard': 'SUM(retard) AS retard',\n    'heures_sup': 'SUM(heures_sup) AS heures_sup',\n    'soll': 'SUM(soll) AS soll, SUM(ist) AS ist, ROUND(SUM(ist)-SUM(soll),2) AS delta',\n    'ist': 'SUM(ist) AS ist, SUM(soll) AS soll, ROUND(SUM(ist)-SUM(soll),2) AS delta',\n    'delta': 'SUM(soll) AS soll, SUM(ist) AS ist, ROUND(SUM(ist)-SUM(soll),2) AS delta'\n  };\n  const selectExpr = metricColMap[nlp.metric] || 'SUM(total_abs) AS total_abs';\n  query = `SELECT report_date, ${groupCol} AS scope_label, ${selectExpr} FROM daily_hr_report WHERE report_date = ${dateExpr} AND ${filter} GROUP BY report_date, ${groupCol};`;\n}\n\nreturn [{ json: { ...data, sql_query: query.trim(), scope_label: scopeLabel, date_expr: dateExpr } }];"
+      },
+      "id": "p008",
+      "name": "Construire SQL",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1750, 200]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "={{ $json.sql_query }}",
+        "options": {}
+      },
+      "id": "p009",
+      "name": "Exécuter SQL",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [2000, 200],
+      "credentials": {
+        "postgres": {
+          "id": "NEON_CRED_ID",
+          "name": "Neon PostgreSQL - HR BMW U11"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// FORMATEUR RÉPONSE MULTILINGUE\n// ⚠️  ML = Maladie | MD = Mise en demeure | SÉPARÉS\n// ============================================================\nconst nlpData = $('NLP — Analyse Question').first().json;\nconst nlp = nlpData.nlp;\nconst sqlData = $('Construire SQL').first().json;\nconst rows = $input.all().map(i => i.json).filter(r => r && r.scope_label);\nconst lang = nlp.language;\nconst metric = nlp.metric;\nconst scope = sqlData.scope_label || nlp.scope_value || 'BMW U11';\n\nfunction fmt(v, dec=1) { if(v===null||v===undefined)return'N/D'; return Number(v).toFixed(dec); }\nfunction fmtDate(d) {\n  if (!d) return 'N/D';\n  try { return new Date(d).toLocaleDateString('fr-TN',{day:'2-digit',month:'2-digit',year:'numeric'}); }\n  catch(e) { return d; }\n}\n\nif (!rows || rows.length === 0) {\n  const noData = {\n    fr: `⚠️ Aucune donnée disponible pour *${scope}*.\\n\\nVérifiez que le rapport a été importé pour cette date.`,\n    ar: `⚠️ لا توجد بيانات متاحة لـ *${scope}*.`,\n    tn: `⚠️ Makatech data disponible pour *${scope}*.`\n  };\n  return [{ json: {\n    response_text: noData[lang] || noData.fr,\n    chat_id: nlpData.chat_id,\n    receiptId: nlpData.receiptId\n  }}];\n}\n\nconst agg = rows.reduce((a,r) => {\n  ['actif','present','nb_abs','p','np','sq','ac','rv','ml','md','maladie','mise_en_demeure','total_abs','heures_presence','retard','heures_sup','soll','ist'].forEach(k => {\n    a[k] = (a[k]||0) + (parseFloat(r[k])||0);\n  });\n  a.report_date = r.report_date;\n  a.scope_label = r.scope_label;\n  return a;\n}, {});\n\nagg.abs_np_rate   = agg.actif ? Math.round(agg.np/agg.actif*10000)/100 : (rows[0]?.abs_np_rate||0);\nagg.abs_p_rate    = agg.actif ? Math.round(agg.p/agg.actif*10000)/100 : (rows[0]?.abs_p_rate||0);\nagg.taux_presence = agg.actif ? Math.round(agg.present/agg.actif*10000)/100 : (rows[0]?.taux_presence||0);\nagg.delta         = rows[0]?.delta !== undefined ? parseFloat(rows[0].delta)||0 : Math.round((agg.ist-agg.soll)*100)/100;\nagg.maladie       = agg.ml;\nagg.mise_en_demeure = agg.md;\n\nconst dl = fmtDate(agg.report_date);\n\nfunction buildMsg(tpls) { return tpls[lang] || tpls.fr; }\nlet responseText = '';\n\nswitch(nlp.intent) {\n  case 'get_summary':\n    responseText = buildMsg({\n      fr: `📊 *Résumé ${scope}*\\n📅 Date : ${dl}\\n\\n👥 Actif : ${fmt(agg.actif,0)} | Présents : ${fmt(agg.present,0)}\\n❌ NP : ${fmt(agg.np,0)} (${fmt(agg.abs_np_rate)}%)\\n🗓️ P : ${fmt(agg.p,0)} (${fmt(agg.abs_p_rate)}%)\\n📊 Total Abs : ${fmt(agg.total_abs,0)}\\n📋 SQ : ${fmt(agg.sq,0)} | AC : ${fmt(agg.ac,0)} | RV : ${fmt(agg.rv,0)}\\n🏥 Maladie ML : ${fmt(agg.maladie,0)}\\n⚠️ Mise/dem MD : ${fmt(agg.mise_en_demeure,0)}\\n✅ Présence : ${fmt(agg.taux_presence)}%\\n⏱️ H.Sup : ${fmt(agg.heures_sup,0)} | Retard : ${fmt(agg.retard,0)}`,\n      ar: `📊 *ملخص ${scope}*\\n📅 التاريخ: ${dl}\\n\\n👥 العدد: ${fmt(agg.actif,0)} | الحاضرون: ${fmt(agg.present,0)}\\n❌ NP: ${fmt(agg.np,0)} (${fmt(agg.abs_np_rate)}%)\\n🗓️ P: ${fmt(agg.p,0)} (${fmt(agg.abs_p_rate)}%)\\n📊 إجمالي الغياب: ${fmt(agg.total_abs,0)}\\n🏥 مرض ML: ${fmt(agg.maladie,0)} | ⚠️ إنذار MD: ${fmt(agg.mise_en_demeure,0)}\\n✅ نسبة الحضور: ${fmt(agg.taux_presence)}%`,\n      tn: `📊 *Résumé ${scope}*\\n📅 Date: ${dl}\\n\\n👥 Actifs: ${fmt(agg.actif,0)} | Présents: ${fmt(agg.present,0)}\\n❌ NP: ${fmt(agg.np,0)} (${fmt(agg.abs_np_rate)}%) | 🗓️ P: ${fmt(agg.p,0)} (${fmt(agg.abs_p_rate)}%)\\n📊 Total Abs: ${fmt(agg.total_abs,0)}\\n🏥 ML: ${fmt(agg.maladie,0)} | ⚠️ MD: ${fmt(agg.mise_en_demeure,0)}\\n✅ Présence: ${fmt(agg.taux_presence)}%`\n    });\n    break;\n\n  case 'top':\n    const topLines = rows.slice(0,5).map((r,i)=>`  ${i+1}. ${r.scope_label||'?'}: ${fmt(r.value||0,0)}`).join('\\n');\n    responseText = buildMsg({\n      fr: `🏆 *Top 5 — ${metric.toUpperCase()} — BMW U11*\\n📅 Date : ${dl}\\n\\n${topLines}`,\n      ar: `🏆 *أعلى 5 — ${metric.toUpperCase()}*\\n📅 التاريخ: ${dl}\\n\\n${topLines}`,\n      tn: `🏆 *Top 5 — ${metric.toUpperCase()}*\\n📅 Date: ${dl}\\n\\n${topLines}`\n    });\n    break;\n\n  default:\n    const templates = {\n      np:              { fr:`📊 *Absence NP — ${scope}*\\n📅 ${dl}\\n\\n❌ NP = ${fmt(agg.np,0)}\\n👥 Actif = ${fmt(agg.actif,0)}\\n📉 Taux NP = ${fmt(agg.abs_np_rate)}%`, ar:`📊 *غياب NP — ${scope}*\\n📅 ${dl}\\n\\n❌ NP = ${fmt(agg.np,0)} | نسبة = ${fmt(agg.abs_np_rate)}%`, tn:`📊 *NP — ${scope}*\\n📅 ${dl}\\n\\n❌ NP = ${fmt(agg.np,0)} (${fmt(agg.abs_np_rate)}%)` },\n      p:               { fr:`📊 *Absence P — ${scope}*\\n📅 ${dl}\\n\\n🗓️ P = ${fmt(agg.p,0)}\\n👥 Actif = ${fmt(agg.actif,0)}\\n📉 Taux P = ${fmt(agg.abs_p_rate)}%`, ar:`📊 *غياب P — ${scope}*\\n📅 ${dl}\\n\\n🗓️ P = ${fmt(agg.p,0)} | نسبة = ${fmt(agg.abs_p_rate)}%`, tn:`📊 *P — ${scope}*\\n📅 ${dl}\\n\\n🗓️ P = ${fmt(agg.p,0)} (${fmt(agg.abs_p_rate)}%)` },\n      sq:              { fr:`📋 *SQ — ${scope}*\\n📅 ${dl}\\n\\n📋 SQ = ${fmt(agg.sq,0)}`, ar:`📋 *SQ — ${scope}*\\n📅 ${dl}\\n\\n📋 SQ = ${fmt(agg.sq,0)}`, tn:`📋 *SQ — ${scope}*\\n📅 ${dl}\\n\\nSQ = ${fmt(agg.sq,0)}` },\n      ac:              { fr:`📋 *AC — ${scope}*\\n📅 ${dl}\\n\\n🔁 AC = ${fmt(agg.ac,0)}`, ar:`📋 *AC — ${scope}*\\n📅 ${dl}\\n\\n🔁 AC = ${fmt(agg.ac,0)}`, tn:`📋 *AC — ${scope}*\\n📅 ${dl}\\n\\nAC = ${fmt(agg.ac,0)}` },\n      rv:              { fr:`📋 *RV — ${scope}*\\n📅 ${dl}\\n\\n📌 RV = ${fmt(agg.rv,0)}`, ar:`📋 *RV — ${scope}*\\n📅 ${dl}\\n\\n📌 RV = ${fmt(agg.rv,0)}`, tn:`📋 *RV — ${scope}*\\n📅 ${dl}\\n\\nRV = ${fmt(agg.rv,0)}` },\n      maladie:         { fr:`🏥 *Maladie ML — ${scope}*\\n📅 ${dl}\\n\\n🤒 ML = ${fmt(agg.maladie,0)}\\n_(MD = Mise en demeure, indicateur séparé)_`, ar:`🏥 *مرض ML — ${scope}*\\n📅 ${dl}\\n\\n🤒 ML = ${fmt(agg.maladie,0)}`, tn:`🏥 *Maladie ML — ${scope}*\\n📅 ${dl}\\n\\n🤒 ML = ${fmt(agg.maladie,0)} (ML seulement)` },\n      mise_en_demeure: { fr:`⚠️ *Mise en demeure MD — ${scope}*\\n📅 ${dl}\\n\\n⚠️ MD = ${fmt(agg.mise_en_demeure,0)}\\n_(ML = Maladie, indicateur séparé)_`, ar:`⚠️ *إنذار MD — ${scope}*\\n📅 ${dl}\\n\\n⚠️ MD = ${fmt(agg.mise_en_demeure,0)}`, tn:`⚠️ *MD — ${scope}*\\n📅 ${dl}\\n\\nMD = ${fmt(agg.mise_en_demeure,0)}` },\n      abs_np_rate:     { fr:`📊 *Taux NP — ${scope}*\\n📅 ${dl}\\n\\n📉 Taux NP = ${fmt(agg.abs_np_rate)}%\\n   NP = ${fmt(agg.np,0)} / Actif = ${fmt(agg.actif,0)}`, ar:`📊 *نسبة NP — ${scope}*\\n📅 ${dl}\\n\\n📉 ${fmt(agg.abs_np_rate)}%`, tn:`📊 *Taux NP — ${scope}*\\n📅 ${dl}\\n\\n📉 ${fmt(agg.abs_np_rate)}% — NP=${fmt(agg.np,0)}` },\n      abs_p_rate:      { fr:`📊 *Taux P — ${scope}*\\n📅 ${dl}\\n\\n📉 Taux P = ${fmt(agg.abs_p_rate)}%\\n   P = ${fmt(agg.p,0)} / Actif = ${fmt(agg.actif,0)}`, ar:`📊 *نسبة P — ${scope}*\\n📅 ${dl}\\n\\n📉 ${fmt(agg.abs_p_rate)}%`, tn:`📊 *Taux P — ${scope}*\\n📅 ${dl}\\n\\n📉 ${fmt(agg.abs_p_rate)}%` },\n      total_abs:       { fr:`📊 *Total Absences — ${scope}*\\n📅 ${dl}\\n\\n👥 Actif : ${fmt(agg.actif,0)}\\n❌ NP : ${fmt(agg.np,0)} | 🗓️ P : ${fmt(agg.p,0)}\\n📊 Total Abs = ${fmt(agg.total_abs,0)}`, ar:`📊 *إجمالي الغيابات — ${scope}*\\n📅 ${dl}\\n\\nNP=${fmt(agg.np,0)} | P=${fmt(agg.p,0)} | Total=${fmt(agg.total_abs,0)}`, tn:`📊 *Total Abs — ${scope}*\\n📅 ${dl}\\n\\nNP=${fmt(agg.np,0)} | P=${fmt(agg.p,0)} | Total=${fmt(agg.total_abs,0)}` },\n      taux_presence:   { fr:`✅ *Taux Présence — ${scope}*\\n📅 ${dl}\\n\\n✅ Taux = ${fmt(agg.taux_presence)}%\\n   Présents = ${fmt(agg.present,0)} / Actif = ${fmt(agg.actif,0)}`, ar:`✅ *نسبة الحضور — ${scope}*\\n📅 ${dl}\\n\\n✅ ${fmt(agg.taux_presence)}%`, tn:`✅ *Présence — ${scope}*\\n📅 ${dl}\\n\\n✅ ${fmt(agg.taux_presence)}%` },\n      delta:           { fr:`⚖️ *Delta Soll/IST — ${scope}*\\n📅 ${dl}\\n\\n🎯 Soll = ${fmt(agg.soll,0)}h\\n✅ IST = ${fmt(agg.ist,0)}h\\n📊 Delta = ${agg.delta>=0?'+':''}${fmt(agg.delta)}h`, ar:`⚖️ *Delta — ${scope}*\\n📅 ${dl}\\n\\nSoll=${fmt(agg.soll,0)}h | IST=${fmt(agg.ist,0)}h | Delta=${fmt(agg.delta)}h`, tn:`⚖️ *Delta — ${scope}*\\n📅 ${dl}\\n\\nSoll=${fmt(agg.soll,0)}h | IST=${fmt(agg.ist,0)}h | Delta=${fmt(agg.delta)}h` },\n      retard:          { fr:`⏰ *Retards — ${scope}*\\n📅 ${dl}\\n\\n⏰ Retards = ${fmt(agg.retard,0)} cas`, ar:`⏰ *تأخيرات — ${scope}*\\n📅 ${dl}\\n\\n⏰ ${fmt(agg.retard,0)}`, tn:`⏰ *Retards — ${scope}*\\n📅 ${dl}\\n\\n⏰ ${fmt(agg.retard,0)} cas` },\n      heures_sup:      { fr:`⏱️ *Heures Sup — ${scope}*\\n📅 ${dl}\\n\\n⏱️ H.Sup = ${fmt(agg.heures_sup,0)}h`, ar:`⏱️ *ساعات إضافية — ${scope}*\\n📅 ${dl}\\n\\n⏱️ ${fmt(agg.heures_sup,0)}h`, tn:`⏱️ *H.Sup — ${scope}*\\n📅 ${dl}\\n\\n${fmt(agg.heures_sup,0)}h sup` },\n      actif:           { fr:`👥 *Effectif Actif — ${scope}*\\n📅 ${dl}\\n\\n👥 Actif = ${fmt(agg.actif,0)}`, ar:`👥 *العدد — ${scope}*\\n📅 ${dl}\\n\\n👥 ${fmt(agg.actif,0)}`, tn:`👥 *Actif — ${scope}*\\n📅 ${dl}\\n\\n👥 ${fmt(agg.actif,0)}` },\n      present:         { fr:`✅ *Présents — ${scope}*\\n📅 ${dl}\\n\\n✅ Présents = ${fmt(agg.present,0)} / ${fmt(agg.actif,0)}\\n📈 Taux = ${fmt(agg.taux_presence)}%`, ar:`✅ *الحاضرون — ${scope}*\\n📅 ${dl}\\n\\n✅ ${fmt(agg.present,0)} / ${fmt(agg.actif,0)}`, tn:`✅ *Présents — ${scope}*\\n📅 ${dl}\\n\\n✅ ${fmt(agg.present,0)} / ${fmt(agg.actif,0)}` },\n      soll:            { fr:`🎯 *Soll — ${scope}*\\n📅 ${dl}\\n\\n🎯 Soll = ${fmt(agg.soll,0)}h | IST = ${fmt(agg.ist,0)}h\\n📊 Delta = ${agg.delta>=0?'+':''}${fmt(agg.delta)}h`, ar:`🎯 *Soll — ${scope}*\\n📅 ${dl}\\n\\nSoll=${fmt(agg.soll,0)}h | IST=${fmt(agg.ist,0)}h`, tn:`🎯 *Soll — ${scope}*\\n📅 ${dl}\\n\\nSoll=${fmt(agg.soll,0)}h` },\n      ist:             { fr:`✅ *IST — ${scope}*\\n📅 ${dl}\\n\\n✅ IST = ${fmt(agg.ist,0)}h | Soll = ${fmt(agg.soll,0)}h\\n📊 Delta = ${agg.delta>=0?'+':''}${fmt(agg.delta)}h`, ar:`✅ *IST — ${scope}*\\n📅 ${dl}\\n\\nIST=${fmt(agg.ist,0)}h | Soll=${fmt(agg.soll,0)}h`, tn:`✅ *IST — ${scope}*\\n📅 ${dl}\\n\\nIST=${fmt(agg.ist,0)}h` }\n    };\n    const tpl = templates[metric] || templates.total_abs;\n    responseText = tpl[lang] || tpl.fr;\n    break;\n}\n\nreturn [{ json: {\n  response_text: responseText,\n  chat_id: nlpData.chat_id,\n  receiptId: nlpData.receiptId\n}}];"
+      },
+      "id": "p010",
+      "name": "Formater Réponse",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2250, 200]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://7107.api.greenapi.com/waInstance7107665040/sendMessage/c550d04c1dde4c11af75f8a7fd04a0bb633108512ec34e8bba",
+        "sendBody": true,
+        "contentType": "json",
+        "body": {
+          "chatId": "={{ $json.chat_id }}",
+          "message": "={{ $json.response_text }}"
+        },
+        "options": {}
+      },
+      "id": "p011",
+      "name": "Envoyer WhatsApp",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [2500, 200]
+    },
+    {
+      "parameters": {
+        "method": "DELETE",
+        "url": "=https://7107.api.greenapi.com/waInstance7107665040/deleteNotification/c550d04c1dde4c11af75f8a7fd04a0bb633108512ec34e8bba/{{ $('📥 Recevoir Notification').first().json.receiptId }}",
+        "options": {}
+      },
+      "id": "p012",
+      "name": "🗑️ Supprimer Notification",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [2750, 200]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://7107.api.greenapi.com/waInstance7107665040/sendMessage/c550d04c1dde4c11af75f8a7fd04a0bb633108512ec34e8bba",
+        "sendBody": true,
+        "contentType": "json",
+        "body": {
+          "chatId": "={{ $('Extraire Message').first().json.chat_id }}",
+          "message": "🚫 Désolé, votre numéro n'est pas autorisé à utiliser HR BMW U11 Chatbot.\n\nContactez votre responsable RH."
+        },
+        "options": {}
+      },
+      "id": "p013",
+      "name": "Non Autorisé",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1500, 500]
+    },
+    {
+      "parameters": {
+        "method": "DELETE",
+        "url": "=https://7107.api.greenapi.com/waInstance7107665040/deleteNotification/c550d04c1dde4c11af75f8a7fd04a0bb633108512ec34e8bba/{{ $('📥 Recevoir Notification').first().json.receiptId }}",
+        "options": {}
+      },
+      "id": "p014",
+      "name": "🗑️ Supprimer Non Autorisé",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1750, 500]
+    }
+  ],
+  "connections": {
+    "⏰ Polling 1 min": {
+      "main": [[{"node": "📥 Recevoir Notification", "type": "main", "index": 0}]]
+    },
+    "📥 Recevoir Notification": {
+      "main": [[{"node": "Extraire Message", "type": "main", "index": 0}]]
+    },
+    "Extraire Message": {
+      "main": [[{"node": "Vérifier Utilisateur", "type": "main", "index": 0}]]
+    },
+    "Vérifier Utilisateur": {
+      "main": [[{"node": "Résultat Auth", "type": "main", "index": 0}]]
+    },
+    "Résultat Auth": {
+      "main": [[{"node": "Autorisé ?", "type": "main", "index": 0}]]
+    },
+    "Autorisé ?": {
+      "main": [
+        [{"node": "NLP — Analyse Question", "type": "main", "index": 0}],
+        [{"node": "Non Autorisé", "type": "main", "index": 0}]
+      ]
+    },
+    "NLP — Analyse Question": {
+      "main": [[{"node": "Construire SQL", "type": "main", "index": 0}]]
+    },
+    "Construire SQL": {
+      "main": [[{"node": "Exécuter SQL", "type": "main", "index": 0}]]
+    },
+    "Exécuter SQL": {
+      "main": [[{"node": "Formater Réponse", "type": "main", "index": 0}]]
+    },
+    "Formater Réponse": {
+      "main": [[{"node": "Envoyer WhatsApp", "type": "main", "index": 0}]]
+    },
+    "Envoyer WhatsApp": {
+      "main": [[{"node": "🗑️ Supprimer Notification", "type": "main", "index": 0}]]
+    },
+    "Non Autorisé": {
+      "main": [[{"node": "🗑️ Supprimer Non Autorisé", "type": "main", "index": 0}]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true
+  },
+  "tags": [],
+  "staticData": null
+}

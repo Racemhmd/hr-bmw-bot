@@ -1,0 +1,74 @@
+# ============================================================
+# HR BMW U11 Chatbot — n8n self-hosted
+# Architecture : n8n (Docker) + Neon PostgreSQL (cloud gratuit)
+#                + Cloudflare Tunnel (HTTPS gratuit)
+# ============================================================
+# Démarrage : docker compose up -d
+# Interface  : http://localhost:5678
+# ============================================================
+
+services:
+  n8n:
+    image: n8nio/n8n:latest
+    container_name: hr_bmw_n8n
+    restart: unless-stopped
+    ports:
+      - "5678:5678"
+    environment:
+      # ── Serveur n8n ─────────────────────────────────────────
+      - N8N_HOST=${N8N_HOST:-localhost}
+      - N8N_PROTOCOL=${N8N_PROTOCOL:-https}
+      - N8N_PORT=5678
+      - WEBHOOK_URL=${WEBHOOK_URL:-http://localhost:5678/}
+      - N8N_EDITOR_BASE_URL=${N8N_EDITOR_BASE_URL:-http://localhost:5678/}
+      - N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY}
+
+      # ── Authentification interface n8n ──────────────────────
+      - N8N_BASIC_AUTH_ACTIVE=true
+      - N8N_BASIC_AUTH_USER=${N8N_BASIC_AUTH_USER:-admin}
+      - N8N_BASIC_AUTH_PASSWORD=${N8N_BASIC_AUTH_PASSWORD}
+
+      # ── Timezone Tunisie ────────────────────────────────────
+      - GENERIC_TIMEZONE=Africa/Tunis
+      - TZ=Africa/Tunis
+
+      # ── Performance & Logs ──────────────────────────────────
+      - N8N_PAYLOAD_SIZE_MAX=50
+      - EXECUTIONS_DATA_PRUNE=true
+      - EXECUTIONS_DATA_MAX_AGE=168
+      - N8N_LOG_LEVEL=info
+
+      # ── Neon PostgreSQL (accessible dans les Code nodes) ────
+      - NEON_DATABASE_URL=${NEON_DATABASE_URL}
+
+      # ── WhatsApp Business Cloud API ─────────────────────────
+      - WHATSAPP_ACCESS_TOKEN=${WHATSAPP_ACCESS_TOKEN}
+      - WHATSAPP_PHONE_NUMBER_ID=${WHATSAPP_PHONE_NUMBER_ID}
+      - WHATSAPP_BUSINESS_ACCOUNT_ID=${WHATSAPP_BUSINESS_ACCOUNT_ID}
+      - WHATSAPP_VERIFY_TOKEN=${WHATSAPP_VERIFY_TOKEN}
+      - WHATSAPP_BOT_NUMBER=${WHATSAPP_BOT_NUMBER:-+21650505484}
+
+      # ── Mot de passe formulaire upload ──────────────────────
+      - UPLOAD_FORM_PASSWORD=${UPLOAD_FORM_PASSWORD:-BMW2024HR!}
+
+    volumes:
+      - n8n_data:/home/node/.n8n
+      - ./files:/files:rw
+
+    networks:
+      - hr_bmw_net
+
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:5678/healthz || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+volumes:
+  n8n_data:
+    driver: local
+
+networks:
+  hr_bmw_net:
+    driver: bridge

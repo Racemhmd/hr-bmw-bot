@@ -1,0 +1,440 @@
+{
+  "name": "Upload Rapport Journalier HR BMW U11",
+  "nodes": [
+    {
+      "id": "a1000001-0000-0000-0000-000000000001",
+      "name": "📋 Formulaire Upload",
+      "type": "n8n-nodes-base.formTrigger",
+      "typeVersion": 2,
+      "position": [
+        240,
+        300
+      ],
+      "webhookId": "hr-bmw-upload-rapport-v3",
+      "parameters": {
+        "formTitle": "Upload Rapport Journalier HR BMW U11",
+        "formDescription": "Uploadez le rapport journalier BMW U11 (HTML, Excel ou CSV)",
+        "responseMode": "responseNode",
+        "formFields": {
+          "values": [
+            {
+              "fieldLabel": "Date du rapport",
+              "fieldType": "date",
+              "requiredField": true
+            },
+            {
+              "fieldLabel": "Plant",
+              "fieldType": "dropdown",
+              "fieldOptions": {
+                "values": [
+                  {
+                    "option": "BMW U11"
+                  }
+                ]
+              },
+              "requiredField": true
+            },
+            {
+              "fieldLabel": "Type rapport",
+              "fieldType": "dropdown",
+              "fieldOptions": {
+                "values": [
+                  {
+                    "option": "Rapport Journalier"
+                  }
+                ]
+              },
+              "requiredField": true
+            },
+            {
+              "fieldLabel": "Fichier rapport",
+              "fieldType": "file",
+              "acceptFileTypes": ".html,.htm,.xlsx,.xls,.csv",
+              "multipleFiles": false,
+              "requiredField": true
+            },
+            {
+              "fieldLabel": "Uploaded by",
+              "fieldType": "text",
+              "requiredField": true
+            }
+          ]
+        },
+        "path": "hr-bmw-upload"
+      }
+    },
+    {
+      "id": "a1000004-0000-0000-0000-000000000004",
+      "name": "📁 Info Fichier",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        680,
+        200
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// ── Extraire infos du fichier uploadé ──────────────────────────\nconst item = items[0];\nconst binaryKeys = Object.keys(item.binary || {});\nif (binaryKeys.length === 0) {\n  throw new Error('Aucun fichier trouvé dans le formulaire');\n}\nconst binaryKey = binaryKeys[0];\nconst binaryMeta = item.binary[binaryKey];\nconst fileName = binaryMeta.fileName || binaryMeta.id || binaryKey;\nconst fileExtension = fileName.split('.').pop().toLowerCase().replace(/[^a-z0-9]/g, '');\n\nreturn [{\n  json: {\n    ...item.json,\n    _binaryKey: binaryKey,\n    _fileName: fileName,\n    _fileExtension: fileExtension,\n    _mimeType: binaryMeta.mimeType || ''\n  },\n  binary: item.binary\n}];"
+      }
+    },
+    {
+      "id": "a1000005-0000-0000-0000-000000000005",
+      "name": "🔀 Type Fichier",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 2,
+      "position": [
+        900,
+        200
+      ],
+      "parameters": {
+        "dataType": "string",
+        "value1": "={{ $json._fileExtension }}",
+        "rules": {
+          "rules": [
+            {
+              "value2": "html",
+              "output": 0
+            },
+            {
+              "value2": "htm",
+              "output": 0
+            },
+            {
+              "value2": "xlsx",
+              "output": 1
+            },
+            {
+              "value2": "xls",
+              "output": 1
+            },
+            {
+              "value2": "csv",
+              "output": 2
+            }
+          ]
+        },
+        "fallbackOutput": 3
+      }
+    },
+    {
+      "id": "a1000006-0000-0000-0000-000000000006",
+      "name": "📄 Parser HTML",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1120,
+        80
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const item = items[0];\nconst binaryKey = item.json._binaryKey || Object.keys(item.binary || {})[0];\nconst binaryMeta = item.binary[binaryKey];\n\n// Laisser l'erreur remonter sans try/catch pour voir le vrai problème\nconst buf = await this.helpers.getBinaryDataBuffer(item, binaryKey);\nconst html = buf.toString('utf-8');\n\nconst MARKER = 'const initialRecords = ';\nif (!html.includes(MARKER)) {\n  throw new Error(\n    'getBinaryDataBuffer OK mais MARKER absent. ' +\n    'html.length=' + html.length + ' ' +\n    'debut=' + JSON.stringify(html.substring(0, 100))\n  );\n}\n\nconst MARKER_END = ';\\nlet currentRecords = [];';\nconst si = html.indexOf(MARKER);\nconst ei = html.indexOf(MARKER_END, si + MARKER.length);\nif (ei === -1) throw new Error('Fin de initialRecords non trouvée.');\n\nconst rawRecords = JSON.parse(html.substring(si + MARKER.length, ei));\nif (!Array.isArray(rawRecords) || !rawRecords.length) throw new Error('initialRecords vide.');\n\nconst MOIS_FR = {\n  'janvier':1,'fevrier':2,'février':2,'mars':3,'avril':4,'mai':5,'juin':6,\n  'juillet':7,'aout':8,'août':8,'septembre':9,'octobre':10,'novembre':11,\n  'decembre':12,'décembre':12\n};\nfunction parseJour(jour, year) {\n  const j = String(jour||'').trim();\n  const m1 = j.match(/^(\\d{1,2})\\/(\\d{1,2})$/);\n  if (m1) return year+'-'+String(+m1[2]).padStart(2,'0')+'-'+String(+m1[1]).padStart(2,'0');\n  const m2 = j.match(/^(\\d{1,2})[-\\s](.+)$/);\n  if (m2) {\n    const mNum = MOIS_FR[m2[2].trim().toLowerCase()];\n    if (mNum) return year+'-'+String(mNum).padStart(2,'0')+'-'+String(+m2[1]).padStart(2,'0');\n  }\n  return null;\n}\n\nconst groups = {};\nfor (const r of rawRecords) {\n  const ym = String(r.kw_y||'').match(/(\\d{4})$/);\n  const year = ym ? ym[1] : String(new Date().getFullYear());\n  const reportDate = parseJour(r.jour, year);\n  if (!reportDate) continue;\n  const plant  = String(r.plant||'BMW U11').trim();\n  const groupe = String(r.groupe||'').trim();\n  const key    = reportDate+'||'+plant+'||'+groupe;\n  if (!groups[key]) groups[key] = {\n    report_date:reportDate, plant, group_name:groupe,\n    process:String(r.psm||'').trim(), circuit:String(r.segment||'').trim(),\n    perimeter:plant, actif:0,present:0,p:0,np:0,sq:0,ac:0,rv:0,ml:0,\n    heures_presence:0,heures_sup:0,retard:0,_rows:0\n  };\n  const g=groups[key];\n  g.actif+=+(r.actif||0); g.present+=+(r.present||0);\n  g.p+=+(r.p||0); g.np+=+(r.np||0); g.sq+=+(r.sq||0);\n  g.ac+=+(r.ac||0); g.rv+=+(r.rv||0); g.ml+=+(r.ml||0);\n  g.heures_presence+=+(r.presence_hours||0);\n  g.heures_sup+=+(r.h_sup||0); g.retard+=+(r.retard||0);\n  g._rows++;\n}\n\nconst uploadedBy = item.json['Uploaded by']||'';\nconst fileName   = item.json._fileName||'';\nconst out = Object.values(groups).map(g => {\n  const ml=g.ml,md=0,p=g.p,np=g.np,actif=g.actif,present=g.present;\n  const r2=v=>parseFloat(v.toFixed(2));\n  return { json:{\n    _parseSource:'html_initialRecords',\n    report_date:g.report_date, plant:g.plant,\n    process:g.process, circuit:g.circuit, group_name:g.group_name, perimeter:g.perimeter,\n    actif,present,nb_abs:actif-present,p,np,sq:g.sq,ac:g.ac,rv:g.rv,\n    ml,md,maladie:ml,mise_en_demeure:md,\n    abs_p_rate:   actif>0?r2(p/actif*100):0,\n    abs_np_rate:  actif>0?r2(np/actif*100):0,\n    total_abs:p+np,\n    taux_presence:actif>0?r2(present/actif*100):0,\n    heures_presence:r2(g.heures_presence),retard:r2(g.retard),\n    heures_sup:r2(g.heures_sup),soll:0,ist:0,delta:0,\n    raw_json:JSON.stringify({source:'html_initialRecords',rows:g._rows}),\n    uploaded_by:uploadedBy,source_file:fileName\n  }};\n});\nif (!out.length) throw new Error('Aucune ligne après agrégation.');\nout[0].json._meta = JSON.stringify({parseSource:'html_initialRecords',rowCount:out.length,uploadedBy,fileName});\nreturn out;"
+      }
+    },
+    {
+      "id": "a1000007-0000-0000-0000-000000000007",
+      "name": "📊 Extraire Excel",
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1,
+      "position": [
+        1120,
+        200
+      ],
+      "parameters": {
+        "operation": "spreadsheet",
+        "binaryPropertyName": "={{ $json._binaryKey }}",
+        "options": {
+          "headerRow": 0,
+          "includeEmptyLines": false,
+          "sheetName": 0
+        }
+      }
+    },
+    {
+      "id": "a1000008-0000-0000-0000-000000000008",
+      "name": "📋 Parser CSV",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1120,
+        320
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const item = items[0];\nconst binaryKey = item.json._binaryKey || Object.keys(item.binary || {})[0];\n\nif (!binaryKey || !item.binary || !item.binary[binaryKey]) {\n  throw new Error('Aucun fichier CSV trouvé');\n}\n\nconst binaryMeta = item.binary[binaryKey];\nconst reportDate = item.json['Date du rapport'];\nconst plant = item.json['Plant'] || 'BMW U11';\nconst uploadedBy = item.json['Uploaded by'] || '';\nconst fileName = item.json._fileName || '';\n\nlet csv;\ntry {\n  if (binaryMeta.data) {\n    csv = Buffer.from(binaryMeta.data, 'base64').toString('utf-8');\n  } else {\n    const buf = await this.helpers.getBinaryDataBuffer(item, binaryKey);\n    csv = buf.toString('utf-8');\n  }\n} catch(e) {\n  throw new Error('Impossible de lire le fichier CSV: ' + e.message);\n}\n\nfunction detectDelim(s) {\n  const c={';':(s.match(/;/g)||[]).length,',':(s.match(/,/g)||[]).length,'\\t':(s.match(/\\t/g)||[]).length,'|':(s.match(/\\|/g)||[]).length};\n  return Object.entries(c).sort((a,b)=>b[1]-a[1])[0][0];\n}\nfunction parseLine(l, d) {\n  const r=[]; let cur='',inQ=false;\n  for (const ch of l) { if(ch==='\"'){inQ=!inQ;}else if(ch===d&&!inQ){r.push(cur.trim());cur='';}else{cur+=ch;} }\n  r.push(cur.trim()); return r;\n}\n\nconst lines = csv.replace(/\\r\\n/g,'\\n').replace(/\\r/g,'\\n').split('\\n').filter(l=>l.trim());\nif (lines.length < 2) throw new Error('Fichier CSV vide');\n\nconst delim = detectDelim(lines.slice(0,5).join('\\n'));\nconst headers = parseLine(lines[0], delim);\nconst rows = [];\nfor (let i=1; i<lines.length; i++) {\n  const cells = parseLine(lines[i], delim);\n  if (cells.every(c=>c==='')) continue;\n  const obj={}; headers.forEach((h,idx)=>{obj[h]=cells[idx]??'';}); rows.push(obj);\n}\n\nif (!rows.length) throw new Error('CSV sans données');\nconst src = 'csv:' + (delim==='\\t'?'tab':delim);\nreturn rows.map(r => ({\n  json: { ...r, _reportDate: reportDate, _plant: plant, _uploadedBy: uploadedBy, _fileName: fileName, _parseSource: src }\n}));"
+      }
+    },
+    {
+      "id": "a1000009-0000-0000-0000-000000000009",
+      "name": "❌ Format Non Supporté",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [
+        1120,
+        460
+      ],
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "❌ Format de fichier non supporté. Utilisez HTML, Excel (.xlsx/.xls) ou CSV.",
+        "options": {
+          "responseCode": 400
+        }
+      }
+    },
+    {
+      "id": "a1000010-0000-0000-0000-000000000010",
+      "name": "🔄 Normaliser Données",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1340,
+        200
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// ── Normaliser colonnes + appliquer règles métier ──────────────────────────\n// REGLE CRITIQUE : maladie = ML SEULEMENT (jamais ML+MD)\n\nconst COLUMN_MAP = {\n  'date':'report_date','date du rapport':'report_date','jour':'report_date',\n  'report_date':'report_date',\n  'plant':'plant','usine':'plant','site':'plant',\n  'perimetre':'perimeter','perimeter':'perimeter','per':'perimeter',\n  'process':'process','processus':'process','proc':'process',\n  'circuit':'circuit','circ':'circuit',\n  'groupe':'group_name','group':'group_name','grp':'group_name',\n  'group name':'group_name','group_name':'group_name',\n  'area':'area','zone':'area','secteur':'area',\n  'actif':'actif','actif hc':'actif','active':'actif','hc':'actif',\n  'headcount':'actif','total actif':'actif',\n  'present':'present','presents':'present','nb presents':'present',\n  'nb abs':'nb_abs','nb_abs':'nb_abs','nombre absence':'nb_abs','absences':'nb_abs',\n  'p':'p','abs p':'p','abs planifiee':'p','planifiee':'p','planned':'p',\n  'np':'np','abs np':'np','abs non planifiee':'np','non planifiee':'np','unplanned':'np',\n  'sq':'sq','sans questionnaire':'sq',\n  'ac':'ac','absence continue':'ac','abs continue':'ac',\n  'rv':'rv','rendez-vous':'rv','rdv':'rv',\n  'ml':'ml','maladie':'ml',\n  'md':'md','mise en demeure':'md','mise-en-demeure':'md',\n  '%abs p':'abs_p_rate','taux abs p':'abs_p_rate','abs_p_rate':'abs_p_rate',\n  '%abs np':'abs_np_rate','taux abs np':'abs_np_rate','abs_np_rate':'abs_np_rate',\n  'total abs':'total_abs','total absence':'total_abs','total_abs':'total_abs',\n  'taux presence':'taux_presence','taux présence':'taux_presence','taux_presence':'taux_presence',\n  'heures presence':'heures_presence','heures_presence':'heures_presence',\n  'h presence':'heures_presence',\n  'retard':'retard','retards':'retard',\n  'h sup':'heures_sup','heures sup':'heures_sup','heures_sup':'heures_sup','hsup':'heures_sup',\n  'soll':'soll','ist':'ist','actuel':'ist',\n  'delta':'delta','ecart':'delta',\n};\n\nconst NUMERIC_COLS = new Set([\n  'actif','present','nb_abs','p','np','sq','ac','rv','ml','md',\n  'abs_p_rate','abs_np_rate','total_abs','taux_presence','heures_presence',\n  'retard','heures_sup','soll','ist','delta'\n]);\n\nfunction normalizeKey(key) {\n  return String(key).toLowerCase()\n    .replace(/[éèêë]/g,'e').replace(/[àâä]/g,'a').replace(/[ùûü]/g,'u')\n    .replace(/[îï]/g,'i').replace(/[ôö]/g,'o').replace(/ç/g,'c')\n    .trim().replace(/\\s+/g,' ');\n}\n\nfunction toNum(v) {\n  if (v===null||v===undefined||v==='') return 0;\n  const n = parseFloat(String(v).replace(',','.').replace(/[^0-9.\\-]/g,''));\n  return isNaN(n)?0:n;\n}\n\nconst allItems = $input.all();\nif (!allItems.length) throw new Error('Aucune donnée reçue pour normalisation');\n\nconst firstItem = allItems[0];\n// Méta globale (formulaire) — utilisée seulement pour CSV/Excel\nconst globalReportDate = firstItem.json._reportDate || firstItem.json['Date du rapport'];\nconst globalPlant      = firstItem.json._plant      || firstItem.json['Plant'] || 'BMW U11';\nconst uploadedBy       = firstItem.json._uploadedBy || firstItem.json['Uploaded by'] || '';\nconst fileName         = firstItem.json._fileName   || '';\nconst parseSource      = firstItem.json._parseSource || 'unknown';\n\n// ── Détection HTML pré-normalisé ────────────────────────────────────────────\nconst isHtml = parseSource === 'html_initialRecords';\n\nconst normalizedItems = allItems.map(item => {\n  const raw = item.json;\n\n  if (isHtml) {\n    // Données déjà agrégées et normalisées par le Parser HTML\n    // Appliquer uniquement les règles ML/MD et recalculer si nécessaire\n    const ml = toNum(raw.ml);\n    const md = toNum(raw.md);\n    const actif   = toNum(raw.actif);\n    const present = toNum(raw.present);\n    const p       = toNum(raw.p);\n    const np      = toNum(raw.np);\n    return { json: {\n      ...raw,\n      ml, md,\n      maladie:          ml,   // REGLE CRITIQUE\n      mise_en_demeure:  md,\n      nb_abs:    raw.nb_abs    ?? (actif - present),\n      total_abs: raw.total_abs ?? (p + np),\n      abs_p_rate:    raw.abs_p_rate    ?? (actif > 0 ? Math.round(p  /actif*10000)/100 : 0),\n      abs_np_rate:   raw.abs_np_rate   ?? (actif > 0 ? Math.round(np /actif*10000)/100 : 0),\n      taux_presence: raw.taux_presence ?? (actif > 0 ? Math.round(present/actif*10000)/100 : 0),\n      delta: raw.delta ?? (toNum(raw.ist) - toNum(raw.soll)),\n      raw_json: raw.raw_json || JSON.stringify(raw),\n    }};\n  }\n\n  // ── Normalisation standard (CSV / Excel) ──────────────────────────────────\n  const norm = {};\n  for (const [key, val] of Object.entries(raw)) {\n    if (key.startsWith('_')) continue;\n    const mapped = COLUMN_MAP[normalizeKey(key)];\n    if (mapped) norm[mapped] = val;\n  }\n\n  for (const col of NUMERIC_COLS) norm[col] = toNum(norm[col]);\n\n  const ml  = toNum(norm.ml);\n  const md  = toNum(norm.md);\n  // REGLE CRITIQUE : maladie = ML SEULEMENT (JAMAIS ml + md)\n  norm.maladie         = ml;\n  norm.mise_en_demeure = md;\n\n  const actif = norm.actif || 0;\n  const p     = norm.p     || 0;\n  const np    = norm.np    || 0;\n\n  if (!norm.total_abs)      norm.total_abs    = p + np;\n  if (!norm.abs_p_rate   && actif>0) norm.abs_p_rate   = Math.round(p/actif*10000)/100;\n  if (!norm.abs_np_rate  && actif>0) norm.abs_np_rate  = Math.round(np/actif*10000)/100;\n  if (!norm.taux_presence && actif>0) norm.taux_presence = Math.round(toNum(norm.present)/actif*10000)/100;\n  if (!norm.delta) norm.delta = toNum(norm.ist) - toNum(norm.soll);\n\n  norm.report_date  = globalReportDate;\n  norm.plant        = globalPlant;\n  norm.uploaded_by  = uploadedBy;\n  norm.source_file  = fileName;\n  norm.raw_json     = JSON.stringify(raw);\n\n  return { json: norm };\n});\n\n// Métadonnées résumé sur le premier item\nnormalizedItems[0].json._meta = JSON.stringify({\n  reportDate: globalReportDate || normalizedItems[0].json.report_date,\n  plant:      globalPlant      || normalizedItems[0].json.plant,\n  uploadedBy, fileName, parseSource,\n  rowCount: normalizedItems.length\n});\n\nreturn normalizedItems;"
+      }
+    },
+    {
+      "id": "a1000011-0000-0000-0000-000000000011",
+      "name": "🛠️ Préparer Insertion",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1540,
+        200
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// ── Préparer les lignes pour insertion Neon PostgreSQL ─────────\nconst allItems = $input.all();\nconst COLS = [\n  'report_date','plant','perimeter','process','circuit','group_name','area',\n  'actif','present','nb_abs','p','np','sq','ac','rv','ml','md',\n  'maladie','mise_en_demeure','abs_p_rate','abs_np_rate','total_abs',\n  'taux_presence','heures_presence','retard','heures_sup','soll','ist','delta',\n  'raw_json','source_file','uploaded_by'\n];\n\nreturn allItems.map(item => {\n  const row = {};\n  for (const col of COLS) {\n    row[col] = item.json[col] ?? null;\n  }\n  // Extraire meta du premier item\n  if (item.json._meta) row._meta = item.json._meta;\n  return { json: row };\n});"
+      }
+    },
+    {
+      "id": "a1000012-0000-0000-0000-000000000012",
+      "name": "🗑️ Supprimer Données Existantes",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        1740,
+        200
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "NEON_CRED_ID",
+          "name": "Neon PostgreSQL - HR BMW U11"
+        }
+      },
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT 1 AS skipped -- upsert remplace le DELETE"
+      }
+    },
+    {
+      "id": "a1000013-0000-0000-0000-000000000013",
+      "name": "💾 Insérer Lignes",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        1940,
+        200
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "NEON_CRED_ID",
+          "name": "Neon PostgreSQL - HR BMW U11"
+        }
+      },
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO daily_hr_report (\n  report_date, plant, perimeter, process, circuit, group_name,\n  actif, present, nb_abs, p, np, sq, ac, rv, ml, md,\n  maladie, mise_en_demeure, abs_p_rate, abs_np_rate, total_abs,\n  taux_presence, heures_presence, retard, heures_sup,\n  soll, ist, delta, raw_json, source_file, uploaded_by\n) VALUES (\n  '{{ $json.report_date }}'::date,\n  '{{ ($json.plant||'BMW U11').replace(/'/g,\"''\") }}',\n  '{{ ($json.perimeter||$json.plant||'BMW U11').replace(/'/g,\"''\") }}',\n  '{{ ($json.process||'').replace(/'/g,\"''\") }}',\n  '{{ ($json.circuit||'').replace(/'/g,\"''\") }}',\n  '{{ ($json.group_name||'').replace(/'/g,\"''\") }}',\n  {{ $json.actif||0 }}, {{ $json.present||0 }}, {{ $json.nb_abs||0 }},\n  {{ $json.p||0 }}, {{ $json.np||0 }}, {{ $json.sq||0 }},\n  {{ $json.ac||0 }}, {{ $json.rv||0 }}, {{ $json.ml||0 }}, {{ $json.md||0 }},\n  {{ $json.maladie||0 }}, {{ $json.mise_en_demeure||0 }},\n  {{ $json.abs_p_rate||0 }}, {{ $json.abs_np_rate||0 }}, {{ $json.total_abs||0 }},\n  {{ $json.taux_presence||0 }}, {{ $json.heures_presence||0 }},\n  {{ $json.retard||0 }}, {{ $json.heures_sup||0 }},\n  {{ $json.soll||0 }}, {{ $json.ist||0 }}, {{ $json.delta||0 }},\n  '{{ ($json.raw_json||'{}').replace(/'/g,\"''\") }}'::jsonb,\n  '{{ ($json.source_file||'').replace(/'/g,\"''\") }}',\n  '{{ ($json.uploaded_by||'').replace(/'/g,\"''\") }}'\n)\nON CONFLICT (report_date, plant, group_name) DO UPDATE SET\n  actif=EXCLUDED.actif, present=EXCLUDED.present, nb_abs=EXCLUDED.nb_abs,\n  p=EXCLUDED.p, np=EXCLUDED.np, sq=EXCLUDED.sq, ac=EXCLUDED.ac, rv=EXCLUDED.rv,\n  ml=EXCLUDED.ml, md=EXCLUDED.md,\n  maladie=EXCLUDED.maladie, mise_en_demeure=EXCLUDED.mise_en_demeure,\n  abs_p_rate=EXCLUDED.abs_p_rate, abs_np_rate=EXCLUDED.abs_np_rate,\n  total_abs=EXCLUDED.total_abs, taux_presence=EXCLUDED.taux_presence,\n  heures_presence=EXCLUDED.heures_presence, retard=EXCLUDED.retard,\n  heures_sup=EXCLUDED.heures_sup, soll=EXCLUDED.soll, ist=EXCLUDED.ist,\n  delta=EXCLUDED.delta, raw_json=EXCLUDED.raw_json,\n  source_file=EXCLUDED.source_file, uploaded_by=EXCLUDED.uploaded_by"
+      }
+    },
+    {
+      "id": "a1000014-0000-0000-0000-000000000014",
+      "name": "📝 Enregistrer Historique",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        2140,
+        200
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "NEON_CRED_ID",
+          "name": "Neon PostgreSQL - HR BMW U11"
+        }
+      },
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO import_history (report_date, plant, source_file, uploaded_by, rows_imported, status, parse_source) VALUES (CURRENT_DATE, 'BMW U11', 'html_upload', '', 0, 'success', 'html_initialRecords') ON CONFLICT DO NOTHING"
+      }
+    },
+    {
+      "id": "a1000015-0000-0000-0000-000000000015",
+      "name": "✅ Succès",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [
+        2340,
+        200
+      ],
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "✅ Rapport journalier BMW U11 importé avec succès !\n\n📊 Les données sont maintenant disponibles dans Neon PostgreSQL.\n💬 Le chatbot WhatsApp est mis à jour.",
+        "options": {
+          "responseCode": 200
+        }
+      }
+    }
+  ],
+  "connections": {
+    "📋 Formulaire Upload": {
+      "main": [
+        [
+          {
+            "node": "📁 Info Fichier",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "📁 Info Fichier": {
+      "main": [
+        [
+          {
+            "node": "🔀 Type Fichier",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "🔀 Type Fichier": {
+      "main": [
+        [
+          {
+            "node": "📄 Parser HTML",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "📊 Extraire Excel",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "📋 Parser CSV",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "❌ Format Non Supporté",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "📄 Parser HTML": {
+      "main": [
+        [
+          {
+            "node": "🔄 Normaliser Données",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "📊 Extraire Excel": {
+      "main": [
+        [
+          {
+            "node": "🔄 Normaliser Données",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "📋 Parser CSV": {
+      "main": [
+        [
+          {
+            "node": "🔄 Normaliser Données",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "🔄 Normaliser Données": {
+      "main": [
+        [
+          {
+            "node": "🛠️ Préparer Insertion",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "🛠️ Préparer Insertion": {
+      "main": [
+        [
+          {
+            "node": "💾 Insérer Lignes",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "💾 Insérer Lignes": {
+      "main": [
+        [
+          {
+            "node": "📝 Enregistrer Historique",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "📝 Enregistrer Historique": {
+      "main": [
+        [
+          {
+            "node": "✅ Succès",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": ""
+  },
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "hr-bmw-u11-instance"
+  },
+  "id": "hr-bmw-upload-workflow-v3",
+  "tags": [
+    {
+      "id": "hr-bmw",
+      "name": "HR BMW U11"
+    }
+  ]
+}
