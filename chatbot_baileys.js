@@ -65,12 +65,12 @@ function detectMetric(t) {
   if (/\bp\b|absence planif|abs p/.test(t) && !/np/.test(t)) return 'p';
   if (/\bsq\b|sans questionnaire/.test(t)) return 'sq';
   if (/\bac\b|absence continue/.test(t)) return 'ac';
-  if (/\brv\b|rendez.vous/.test(t)) return 'rv';
+  if (/\brv\b|rendez.vous|renvoi/.test(t)) return 'rv';
   // ML = Maladie Prolongée SEULEMENT — jamais mélanger avec MD
   if (/\bml\b|maladie prol|مرض طويل|مرض مطوّل/.test(t) && !/mise en demeure|\bmd\b|quitt|démiss/.test(t)) return 'maladie';
   if (/maladie/.test(t) && !/mise en demeure|\bmd\b|quitt|démiss/.test(t)) return 'maladie';
-  // MD = Mise en demeure (quittement) SEULEMENT — jamais mélanger avec ML
-  if (/\bmd\b|mise en demeure|quitt|démiss|إنذار|إنهاء عقد/.test(t)) return 'mise_en_demeure';
+  // MD = Mise en demeure (fluctuation) SEULEMENT — jamais mélanger avec ML
+  if (/\bmd\b|mise en demeure|fluctuation|إنذار|إنهاء عقد/.test(t)) return 'mise_en_demeure';
   if (/\bdelta\b|soll.*ist|ist.*soll|écart/.test(t)) return 'delta';
   if (/h.*sup|heures sup/.test(t)) return 'heures_sup';
   if (/heures.*pré|heures.*pres|h\.pres|hpres|وقت الحضور|ساعات الحضور/.test(t)) return 'heures_presence';
@@ -107,6 +107,9 @@ function detectCircuitName(t) {
 function detectAreaName(t) {
   if (/mabrouk|abdelhamid/.test(t)) return '%mabrouk%';
   if (/laarabi|laarbi|mustpha|moustfa/.test(t)) return '%laarabi%';
+  // HO + numéro/zone
+  if (/ho\s*1|area\s*1|zone\s*pgtf/.test(t)) return '%mabrouk%';
+  if (/ho\s*2|area\s*2|zone\s*(shelf|wpa|basis)/.test(t)) return '%laarabi%';
   return null;
 }
 
@@ -151,6 +154,9 @@ function detectIntent(t, metric) {
   if (metric === 'summary') return 'get_summary';
   if (/top|classement|le plus|plus.*abs/.test(t)) return 'top';
   if (/compar|évolution|evolution|vs\b|entre.*et|n-1|jour.*(précédent|avant)/.test(t)) return 'compare';
+  if (/chaque\s+groupe|tous\s+les\s+groupe|par\s+groupe|each\s+group/.test(t)) return 'list_group';
+  if (/chaque\s+(area|ho)|par\s+(area|ho)|tous\s+les\s+(area|ho)/.test(t)) return 'list_area';
+  if (/chaque\s+(process|circuit)|par\s+(process|circuit)/.test(t)) return 'list_circuit';
   return 'get_metric';
 }
 
@@ -187,6 +193,32 @@ function buildSQL(nlp) {
     filter = `plant ILIKE 'BMW U11'`;
     if (nlp.scope_circuit) filter += ` AND circuit ILIKE '${safe(nlp.scope_circuit)}'`;
     if (nlp.scope_process) filter += ` AND process ILIKE '${safe(nlp.scope_process)}'`;
+  }
+
+  // ── Requêtes LIST (chaque groupe / area / circuit) ─────────────
+  const listColMap = { list_group:'group_name', list_area:'process', list_circuit:'circuit' };
+  if (listColMap[intent]) {
+    const listCol = listColMap[intent];
+    const metricColMap = {
+      np:'SUM(np) AS value, SUM(actif) AS actif',
+      p:'SUM(p) AS value, SUM(actif) AS actif',
+      sq:'SUM(sq) AS value', ac:'SUM(ac) AS value', rv:'SUM(rv) AS value',
+      maladie:'SUM(ml) AS value', mise_en_demeure:'SUM(md) AS value',
+      abs_np_rate:'SUM(np) AS np, SUM(actif) AS actif, ROUND(SUM(np)/NULLIF(SUM(actif),0)*100,2) AS value',
+      abs_p_rate:'SUM(p) AS p, SUM(actif) AS actif, ROUND(SUM(p)/NULLIF(SUM(actif),0)*100,2) AS value',
+      taux_presence:'SUM(present) AS present, SUM(actif) AS actif, ROUND(SUM(present)/NULLIF(SUM(actif),0)*100,2) AS value',
+      total_abs:'SUM(total_abs) AS value, SUM(np) AS np, SUM(p) AS p',
+      actif:'SUM(actif) AS value',
+      present:'SUM(present) AS value, SUM(actif) AS actif',
+      heures_sup:'SUM(heures_sup) AS value',
+      heures_presence:'SUM(heures_presence) AS value',
+      retard:'SUM(retard) AS value',
+      delta:'SUM(soll) AS soll, SUM(ist) AS ist, ROUND(SUM(ist)-SUM(soll),2) AS value',
+    };
+    const listSel = metricColMap[metric] || 'SUM(total_abs) AS value, SUM(np) AS np, SUM(p) AS p';
+    return `SELECT ${listCol} AS scope_label, ${listSel}
+      FROM daily_hr_report WHERE report_date = ${dateExpr} AND plant ILIKE 'BMW U11'
+      GROUP BY ${listCol} ORDER BY value DESC NULLS LAST LIMIT 30`;
   }
 
   if (intent === 'get_summary') {
@@ -236,6 +268,46 @@ function fmtDate(d) {
   if (!d) return 'N/D';
   try { return new Date(d).toLocaleDateString('fr-TN',{day:'2-digit',month:'2-digit',year:'numeric'}); }
   catch(e) { return String(d); }
+}
+
+function formatList(rows, nlp) {
+  if (!rows || rows.length === 0) return `⚠️ Aucune donnée disponible.\nVérifiez que le rapport a été importé.`;
+  const { metric, intent, language: lang } = nlp;
+  const isPct = ['abs_np_rate','abs_p_rate','taux_presence'].includes(metric);
+  const unit = isPct ? '%' : '';
+  const metricLabel = {
+    np:'NP', p:'P', sq:'SQ', ac:'AC', rv:'RV (Renvoi)',
+    maladie:'ML (Maladie Prolongée)', mise_en_demeure:'MD (Mise en demeure - Fluctuation)',
+    abs_np_rate:'Taux NP %', abs_p_rate:'Taux P %', taux_presence:'Taux Présence %',
+    total_abs:'Total Abs', actif:'Effectif Actif', present:'Présents',
+    heures_sup:'H.Sup', heures_presence:'H.Présence', retard:'Retard',
+    delta:'Delta Soll/IST'
+  }[metric] || metric.toUpperCase();
+
+  const groupLabel = { list_group:'Groupe', list_area:'Area (HO)', list_circuit:'Circuit/Process' }[intent] || 'Scope';
+  const dateLabel = rows[0]?.report_date ? fmtDate(rows[0].report_date) : '';
+
+  let lines;
+  if (metric === 'delta') {
+    lines = rows.filter(r => r.scope_label).map((r,i) => {
+      const soll = fmt(parseFloat(r.soll)||0,0);
+      const ist  = fmt(parseFloat(r.ist)||0,0);
+      const d    = parseFloat(r.value)||0;
+      const sign = d >= 0 ? '+' : '';
+      return `  ${i+1}. *${r.scope_label}*\n     Soll=${soll}h | IST=${ist}h | Δ=${sign}${fmt(d)}h`;
+    }).join('\n');
+  } else {
+    lines = rows.filter(r => r.scope_label).map((r,i) => {
+      const v = parseFloat(r.value)||0;
+      const actif = r.actif ? ` / ${fmt(parseFloat(r.actif)||0,0)} actif` : '';
+      return `  ${i+1}. *${r.scope_label}* : ${fmt(v)}${unit}${actif}`;
+    }).join('\n');
+  }
+
+  if (lang === 'ar') {
+    return `📊 *${metricLabel} — لكل ${groupLabel}*\n📅 ${dateLabel}\n\n${lines}`;
+  }
+  return `📊 *${metricLabel} — par ${groupLabel}*\n📅 ${dateLabel}\n\n${lines}`;
 }
 
 function aggRows(rows) {
@@ -321,7 +393,7 @@ function formatResponse(rows, nlp) {
          `📊 Total Abs : ${fmt(agg.total_abs,0)}\n\n` +
          `📋 SQ : ${fmt(agg.sq,0)} | AC : ${fmt(agg.ac,0)} | RV : ${fmt(agg.rv,0)}\n\n` +
          `🏥 ML (Maladie Prolongée) : ${fmt(agg.maladie,0)}\n` +
-         `🚪 MD (Mise en demeure / Quittement) : ${fmt(agg.mise_en_demeure,0)}\n` +
+         `🚪 MD (Mise en demeure / Fluctuation) : ${fmt(agg.mise_en_demeure,0)}\n` +
          `⚠️ _ML et MD sont deux indicateurs séparés_\n\n` +
          `⏱️ H.Sup : ${fmt(agg.heures_sup,0)} | ⏰ Retard : ${fmt(agg.retard,0)}`,
       ar:`📊 *ملخص ${scope}*\n📅 ${dl}\n\n` +
@@ -335,7 +407,7 @@ function formatResponse(rows, nlp) {
          `👥 ${fmt(agg.actif,0)} | Présents: ${fmt(agg.present,0)} (${fmt(agg.taux_presence)}%)\n` +
          `NP: ${fmt(agg.np,0)} (${fmt(agg.abs_np_rate)}%) | P: ${fmt(agg.p,0)} (${fmt(agg.abs_p_rate)}%)\n` +
          `Total: ${fmt(agg.total_abs,0)}\n` +
-         `ML (Maladie Prol.): ${fmt(agg.maladie,0)} | MD (Quittement): ${fmt(agg.mise_en_demeure,0)}\n` +
+         `ML (Maladie Prol.): ${fmt(agg.maladie,0)} | MD (Fluctuation): ${fmt(agg.mise_en_demeure,0)}\n` +
          `H.Sup: ${fmt(agg.heures_sup,0)} | Retard: ${fmt(agg.retard,0)}`
     };
     return t[lang]||t.fr;
@@ -349,13 +421,13 @@ function formatResponse(rows, nlp) {
     p:{fr:`📊 *Absence P — ${scope}*\n📅 ${dl}\n\n🗓️ P = ${fmt(agg.p,0)}\n👥 Actif = ${fmt(agg.actif,0)}\n📉 Taux P = ${fmt(agg.abs_p_rate)}%`,ar:`📊 *غياب P*\n📅 ${dl}\n\n🗓️ P = ${fmt(agg.p,0)} | ${fmt(agg.abs_p_rate)}%`,tn:`📊 *P — ${scope}*\n📅 ${dl}\n\n🗓️ P = ${fmt(agg.p,0)} (${fmt(agg.abs_p_rate)}%)`},
     sq:{fr:`📋 *SQ — ${scope}*\n📅 ${dl}\n\n📋 SQ = ${fmt(agg.sq,0)}`,ar:`📋 *SQ*\n📅 ${dl}\n\nSQ = ${fmt(agg.sq,0)}`,tn:`📋 *SQ*\n📅 ${dl}\n\nSQ = ${fmt(agg.sq,0)}`},
     ac:{fr:`📋 *AC — ${scope}*\n📅 ${dl}\n\n🔁 AC = ${fmt(agg.ac,0)}`,ar:`📋 *AC*\n📅 ${dl}\n\nAC = ${fmt(agg.ac,0)}`,tn:`📋 *AC*\n📅 ${dl}\n\nAC = ${fmt(agg.ac,0)}`},
-    rv:{fr:`📋 *RV — ${scope}*\n📅 ${dl}\n\n📌 RV = ${fmt(agg.rv,0)}`,ar:`📋 *RV*\n📅 ${dl}\n\nRV = ${fmt(agg.rv,0)}`,tn:`📋 *RV*\n📅 ${dl}\n\nRV = ${fmt(agg.rv,0)}`},
+    rv:{fr:`📋 *RV — Renvoi — ${scope}*\n📅 ${dl}\n\n📌 RV (Renvoi) = ${fmt(agg.rv,0)}`,ar:`📋 *RV — رفض*\n📅 ${dl}\n\nRV = ${fmt(agg.rv,0)}`,tn:`📋 *RV (Renvoi)*\n📅 ${dl}\n\nRV = ${fmt(agg.rv,0)}`},
     maladie:{
       fr:`🏥 *ML — Maladie Prolongée — ${scope}*\n📅 ${dl}\n\n🤒 ML (Maladie Prolongée) = ${fmt(agg.maladie,0)}\n\n⚠️ _ML ≠ MD : ML = maladie prolongée SEULEMENT\nMD = mise en demeure (quittement) — indicateur séparé_`,
       ar:`🏥 *ML — مرض طويل الأمد — ${scope}*\n📅 ${dl}\n\n🤒 ML = ${fmt(agg.maladie,0)}\n_(ML = مرض فقط — MD = إنهاء عقد، مؤشر منفصل)_`,
       tn:`🏥 *ML — Maladie Prolongée — ${scope}*\n📅 ${dl}\n\nML = ${fmt(agg.maladie,0)}\n_(ML ≠ MD: ML = maladie, MD = quittement)_`},
     mise_en_demeure:{
-      fr:`⚠️ *MD — Mise en demeure (Quittement) — ${scope}*\n📅 ${dl}\n\n🚪 MD (Mise en demeure / Quittement) = ${fmt(agg.mise_en_demeure,0)}\n\n⚠️ _MD ≠ ML : MD = quittement SEULEMENT\nML = maladie prolongée — indicateur séparé_`,
+      fr:`⚠️ *MD — Mise en demeure (Fluctuation) — ${scope}*\n📅 ${dl}\n\n🚪 MD (Mise en demeure / Fluctuation) = ${fmt(agg.mise_en_demeure,0)}\n\n⚠️ _MD ≠ ML : MD = quittement SEULEMENT\nML = maladie prolongée — indicateur séparé_`,
       ar:`⚠️ *MD — إنهاء عقد / إنذار — ${scope}*\n📅 ${dl}\n\n🚪 MD = ${fmt(agg.mise_en_demeure,0)}\n_(MD = إنهاء عقد فقط — ML = مرض، مؤشر منفصل)_`,
       tn:`⚠️ *MD — Mise en demeure — ${scope}*\n📅 ${dl}\n\nMD = ${fmt(agg.mise_en_demeure,0)}\n_(MD ≠ ML: MD = quittement, ML = maladie)_`},
     abs_np_rate:{fr:`📊 *Taux NP — ${scope}*\n📅 ${dl}\n\n📉 Taux NP = ${fmt(agg.abs_np_rate)}%\n   NP = ${fmt(agg.np,0)} / Actif = ${fmt(agg.actif,0)}`,ar:`📊 *نسبة NP*\n📅 ${dl}\n\n📉 ${fmt(agg.abs_np_rate)}%`,tn:`📊 *Taux NP*\n📅 ${dl}\n\n📉 ${fmt(agg.abs_np_rate)}% (NP=${fmt(agg.np,0)})`},
@@ -424,7 +496,6 @@ async function processMessage(sock, jid, text) {
   }
 
   const nlp = { metric, intent, language: lang, scope_type: scope.type, scope_value: scope.value, scope_process: scope.process||null, scope_circuit: scope.circuit||null, date_mode: date.mode, date: date.date };
-  // Label lisible pour les réponses
   nlp.scope_label = scope.type === 'circuit' ? scope.value
                   : scope.type === 'area' ? scope.value.replace(/%/g,'').trim()
                   : scope.value;
@@ -434,7 +505,12 @@ async function processMessage(sock, jid, text) {
   const rows = await dbQuery(sql);
   console.log(`   📋 ${rows.length} ligne(s) trouvée(s)`);
 
-  const response = formatResponse(rows, nlp);
+  let response;
+  if (['list_group','list_area','list_circuit'].includes(intent)) {
+    response = formatList(rows, nlp);
+  } else {
+    response = formatResponse(rows, nlp);
+  }
   await sock.sendMessage(jid, { text: response });
   console.log(`   ✅ Réponse envoyée`);
 }
