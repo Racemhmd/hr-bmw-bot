@@ -253,20 +253,8 @@ async function processMessage(sock, jid, text) {
 
   console.log(`\n💬 [${phone}] "${text}"`);
 
-  // Vérifier autorisation
-  const users = await dbQuery(
-    'SELECT * FROM allowed_whatsapp_users WHERE phone_number = $1 AND is_active = TRUE LIMIT 1',
-    [phone]
-  );
-
-  if (users.length === 0) {
-    console.log(`   🚫 Non autorisé: ${phone}`);
-    await sock.sendMessage(jid, { text: '🚫 Désolé, votre numéro n\'est pas autorisé.\n\nContactez votre responsable RH.' });
-    return;
-  }
-
-  const user = users[0];
-  console.log(`   ✅ Autorisé: ${user.full_name} (${user.role})`);
+  // Tous les numéros sont autorisés — accès libre
+  console.log(`   ✅ Accès libre: ${phone}`);
 
   // NLP
   const lang   = detectLang(t);
@@ -274,11 +262,6 @@ async function processMessage(sock, jid, text) {
   let   metric = detectMetric(t);
   let   scope  = detectScope(t);
   const intent = detectIntent(t, metric);
-
-  // Restriction scope superviseur
-  if (user.role === 'supervisor' && user.allowed_scope_type && user.allowed_scope_value) {
-    if (scope.type === 'plant') { scope = { type: user.allowed_scope_type, value: user.allowed_scope_value }; }
-  }
 
   const nlp = { metric, intent, language: lang, scope_type: scope.type, scope_value: scope.value, scope_process: scope.process||null, date_mode: date.mode, date: date.date };
   console.log(`   📊 NLP: ${intent} | ${metric} | ${scope.value} | ${date.mode} | ${lang}`);
