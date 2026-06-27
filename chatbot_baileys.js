@@ -260,11 +260,20 @@ async function startBot() {
 
   sock.ev.on('creds.update', saveCreds);
 
-  sock.ev.on('connection.update', (update) => {
+  sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
     if (qr) {
       console.log('\n📱 Scannez ce QR code avec WhatsApp du +216 28 995 222:\n');
       qrcode.generate(qr, { small: true });
+      try {
+        const QRCode = require('qrcode');
+        const qrPath = '/sdcard/Download/whatsapp_qr.png';
+        await QRCode.toFile(qrPath, qr);
+        console.log('📱 QR sauvegardé: ' + qrPath);
+        console.log('👉 Ouvrez la Galerie → whatsapp_qr.png → scannez avec WhatsApp de +216 28 995 222');
+      } catch(e) {
+        console.log('⚠️ PNG non généré (normal sur PC):', e.message);
+      }
     }
     if (connection === 'close') {
       const code = (lastDisconnect?.error instanceof Boom)
