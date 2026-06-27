@@ -81,57 +81,52 @@ function detectMetric(t) {
   return 'total_abs';
 }
 
-// Noms de process exacts (tels que stockés dans la colonne process)
-const PROCESS_NAMES = [
-  'assembly','electrical test','electrical','bak','paint','press',
-  'body','logistic','maintenance','quality','trim','chassis','engine',
-  'final','pre-delivery','pdi','audit'
-];
-// Noms de circuits (colonne circuit/segment)
-const CIRCUIT_NAMES = ['pgtf','shelf','wpa','line','assy','test'];
-
-function detectProcessName(t) {
-  if (/electrical[\s-]?test|elec[\s-]?test/.test(t)) return 'electrical test';
-  if (/\bassembly\b|assemblage|montage/.test(t)) return 'assembly';
-  if (/\bbak\b/.test(t)) return 'bak';
-  if (/paint|peinture/.test(t)) return 'paint';
-  if (/\bpress\b|presse/.test(t)) return 'press';
-  if (/body|caisse/.test(t)) return 'body';
-  if (/logistic|logistique/.test(t)) return 'logistic';
-  if (/maintenance/.test(t)) return 'maintenance';
-  if (/quality|qualité/.test(t)) return 'quality';
-  if (/trim/.test(t)) return 'trim';
-  if (/chassis/.test(t)) return 'chassis';
-  if (/engine|moteur/.test(t)) return 'engine';
-  if (/final/.test(t)) return 'final';
+// ── Détection Circuit (colonne circuit dans DB) ──────────────────
+// Circuits réels : PGTF-1, PGTF-2, PGTF-3, Shelf, WPA, Basis,
+//                  Circuit, Seg Circuit, Rework Area, Zone Rework,
+//                  Muster, Formation, Non Affecté
+function detectCircuitName(t) {
+  if (/pgtf[\s\-]?1/.test(t)) return 'PGTF-1';
+  if (/pgtf[\s\-]?2/.test(t)) return 'PGTF-2';
+  if (/pgtf[\s\-]?3/.test(t)) return 'PGTF-3';
+  if (/\bpgtf\b/.test(t)) return '%PGTF%';          // tous PGTF
+  if (/\bshelf\b/.test(t)) return 'Shelf';
+  if (/\bwpa\b/.test(t)) return 'WPA';
+  if (/\bbasis\b/.test(t)) return 'Basis';
+  if (/rework|zone.?rework/.test(t)) return '%ework%';
+  if (/seg.?circuit/.test(t)) return 'Seg Circuit';
+  if (/\bcircuit\b/.test(t) && !/seg/.test(t)) return 'Circuit';
+  if (/\bmuster\b/.test(t)) return 'Muster';
+  if (/\bformation\b/.test(t)) return '%ormation%';
+  if (/non.?affect/.test(t)) return '%Non%affect%';
   return null;
 }
 
-function detectCircuitName(t) {
-  if (/\bpgtf\b/.test(t)) return 'pgtf';
-  if (/\bshelf\b/.test(t)) return 'shelf';
-  if (/\bwpa\b/.test(t)) return 'wpa';
+// ── Détection Area/Process (colonne process = nom responsable) ───
+// Areas : Abdelhamid Mabrouk (PGTF zone), Mustpha Laarabi (Shelf/WPA/Basis zone)
+function detectAreaName(t) {
+  if (/mabrouk|abdelhamid/.test(t)) return '%mabrouk%';
+  if (/laarabi|laarbi|mustpha|moustfa/.test(t)) return '%laarabi%';
   return null;
 }
 
 function detectScope(t) {
-  const g = t.match(/\b(g[-.]?\d{3,4})\b/i);
-  const procName = detectProcessName(t);
+  // Groupe G-XXX ou G-XXX-Y
+  const g = t.match(/\b(g[-.]?\d{3,4}(?:[-.]?\d)?)\b/i);
   const circName = detectCircuitName(t);
+  const areaName = detectAreaName(t);
 
-  if (g && procName) {
-    // Groupe + process → filtre combiné
-    return { type: 'group_name', value: g[0].replace(/[\s.]/g,'-').toUpperCase(), process: procName, circuit: null };
-  }
   if (g) {
-    return { type: 'group_name', value: g[0].replace(/[\s.]/g,'-').toUpperCase(), process: null, circuit: null };
-  }
-  if (procName && !g) {
-    // Process seul → scope = process (toute la plant filtrée par process)
-    return { type: 'process', value: procName, process: procName, circuit: null };
+    // Groupe seul ou groupe + circuit
+    return { type: 'group_name', value: g[0].replace(/\./g,'-').toUpperCase(), process: areaName, circuit: circName };
   }
   if (circName) {
-    return { type: 'circuit', value: circName, process: null, circuit: circName };
+    // Circuit spécifique (PGTF-1, Shelf, WPA...)
+    return { type: 'circuit', value: circName, process: areaName, circuit: circName };
+  }
+  if (areaName) {
+    // Area (Mabrouk / Laarabi)
+    return { type: 'area', value: areaName, process: areaName, circuit: null };
   }
   return { type: 'plant', value: 'BMW U11', process: null, circuit: null };
 }
@@ -172,20 +167,26 @@ function buildSQL(nlp) {
 
   // Déterminer colonne de groupement et filtre selon scope_type
   let col, filter;
+  const safe = v => (v||'').replace(/'/g,"''");
+
   if (scope_type === 'group_name') {
     col = 'group_name';
-    filter = `group_name ILIKE '${scope_value.replace(/'/g,"''")}'`;
-    if (scope_process) filter += ` AND process ILIKE '${scope_process.replace(/'/g,"''")}'`;
-  } else if (scope_type === 'process') {
-    col = 'process';
-    filter = `plant ILIKE 'BMW U11' AND process ILIKE '${scope_value.replace(/'/g,"''")}'`;
+    filter = `group_name ILIKE '${safe(scope_value)}'`;
+    if (nlp.scope_circuit) filter += ` AND circuit ILIKE '${safe(nlp.scope_circuit)}'`;
+    if (nlp.scope_process) filter += ` AND process ILIKE '${safe(nlp.scope_process)}'`;
   } else if (scope_type === 'circuit') {
     col = 'circuit';
-    filter = `plant ILIKE 'BMW U11' AND circuit ILIKE '${scope_value.replace(/'/g,"''")}'`;
+    // Supporte les wildcards % dans la valeur
+    filter = `plant ILIKE 'BMW U11' AND circuit ILIKE '${safe(scope_value)}'`;
+    if (nlp.scope_process) filter += ` AND process ILIKE '${safe(nlp.scope_process)}'`;
+  } else if (scope_type === 'area') {
+    col = 'process';
+    filter = `plant ILIKE 'BMW U11' AND process ILIKE '${safe(scope_value)}'`;
   } else {
     col = 'plant';
     filter = `plant ILIKE 'BMW U11'`;
-    if (scope_process) filter += ` AND process ILIKE '${scope_process.replace(/'/g,"''")}'`;
+    if (nlp.scope_circuit) filter += ` AND circuit ILIKE '${safe(nlp.scope_circuit)}'`;
+    if (nlp.scope_process) filter += ` AND process ILIKE '${safe(nlp.scope_process)}'`;
   }
 
   if (intent === 'get_summary') {
@@ -423,6 +424,10 @@ async function processMessage(sock, jid, text) {
   }
 
   const nlp = { metric, intent, language: lang, scope_type: scope.type, scope_value: scope.value, scope_process: scope.process||null, scope_circuit: scope.circuit||null, date_mode: date.mode, date: date.date };
+  // Label lisible pour les réponses
+  nlp.scope_label = scope.type === 'circuit' ? scope.value
+                  : scope.type === 'area' ? scope.value.replace(/%/g,'').trim()
+                  : scope.value;
 
   // SQL + réponse
   const sql  = buildSQL(nlp);
