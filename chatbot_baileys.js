@@ -66,10 +66,14 @@ function detectMetric(t) {
   if (/\bsq\b|sans questionnaire/.test(t)) return 'sq';
   if (/\bac\b|absence continue/.test(t)) return 'ac';
   if (/\brv\b|rendez.vous/.test(t)) return 'rv';
-  if (/\bml\b|maladie|مرض/.test(t) && !/mise en demeure|\bmd\b/.test(t)) return 'maladie';
-  if (/\bmd\b|mise en demeure/.test(t)) return 'mise_en_demeure';
+  // ML = Maladie Prolongée SEULEMENT — jamais mélanger avec MD
+  if (/\bml\b|maladie prol|مرض طويل|مرض مطوّل/.test(t) && !/mise en demeure|\bmd\b|quitt|démiss/.test(t)) return 'maladie';
+  if (/maladie/.test(t) && !/mise en demeure|\bmd\b|quitt|démiss/.test(t)) return 'maladie';
+  // MD = Mise en demeure (quittement) SEULEMENT — jamais mélanger avec ML
+  if (/\bmd\b|mise en demeure|quitt|démiss|إنذار|إنهاء عقد/.test(t)) return 'mise_en_demeure';
   if (/\bdelta\b|soll.*ist|ist.*soll|écart/.test(t)) return 'delta';
   if (/h.*sup|heures sup/.test(t)) return 'heures_sup';
+  if (/heures.*pré|heures.*pres|h\.pres|hpres|وقت الحضور|ساعات الحضور/.test(t)) return 'heures_presence';
   if (/retard/.test(t)) return 'retard';
   if (/actif|effectif/.test(t) && !/absence/.test(t)) return 'actif';
   if (/présent|present/.test(t) && !/taux/.test(t)) return 'present';
@@ -77,10 +81,22 @@ function detectMetric(t) {
   return 'total_abs';
 }
 
+function detectProcess(t) {
+  if (/assembly|assemblage|montage/.test(t)) return 'ASSEMBLY';
+  if (/press|presse/.test(t)) return 'PRESS';
+  if (/body|caisse/.test(t)) return 'BODY';
+  if (/paint|peinture/.test(t)) return 'PAINT';
+  if (/logistic|logistique/.test(t)) return 'LOGISTIC';
+  if (/quality|qualité/.test(t)) return 'QUALITY';
+  if (/maintenance/.test(t)) return 'MAINTENANCE';
+  return null;
+}
+
 function detectScope(t) {
   const g = t.match(/\b(g[-.]?\d{3,4})\b/i);
-  if (g) return { type: 'group_name', value: g[0].replace(/[\s.]/g,'-').toUpperCase() };
-  return { type: 'plant', value: 'BMW U11' };
+  const process = detectProcess(t);
+  if (g) return { type: 'group_name', value: g[0].replace(/[\s.]/g,'-').toUpperCase(), process };
+  return { type: 'plant', value: 'BMW U11', process };
 }
 
 function detectIntent(t, metric) {
@@ -91,7 +107,7 @@ function detectIntent(t, metric) {
 
 // ── SQL Builder ──────────────────────────────────────────────────
 function buildSQL(nlp) {
-  const { metric, scope_type, scope_value, date_mode, date, intent } = nlp;
+  const { metric, scope_type, scope_value, scope_process, date_mode, date, intent } = nlp;
   let dateExpr;
   if (date_mode === 'specific' && date) dateExpr = `'${date}'::date`;
   else if (date_mode === 'today') dateExpr = 'CURRENT_DATE';
@@ -99,7 +115,8 @@ function buildSQL(nlp) {
   else dateExpr = '(SELECT MAX(report_date) FROM daily_hr_report)';
 
   const col = scope_type === 'group_name' ? 'group_name' : 'plant';
-  const filter = `${col} ILIKE '${scope_value.replace(/'/g,"''")}'`;
+  let filter = `${col} ILIKE '${scope_value.replace(/'/g,"''")}'`;
+  if (scope_process) filter += ` AND process ILIKE '${scope_process.replace(/'/g,"''")}'`;
 
   if (intent === 'get_summary') {
     return `SELECT report_date, ${col} AS scope_label,
@@ -129,7 +146,9 @@ function buildSQL(nlp) {
     abs_p_rate: 'SUM(p) AS p, SUM(actif) AS actif, ROUND(SUM(p)/NULLIF(SUM(actif),0)*100,2) AS abs_p_rate',
     total_abs: 'SUM(total_abs) AS total_abs, SUM(p) AS p, SUM(np) AS np',
     taux_presence: 'SUM(present) AS present, SUM(actif) AS actif, ROUND(SUM(present)/NULLIF(SUM(actif),0)*100,2) AS taux_presence',
-    heures_sup: 'SUM(heures_sup) AS heures_sup', retard: 'SUM(retard) AS retard',
+    heures_sup: 'SUM(heures_sup) AS heures_sup',
+    heures_presence: 'SUM(heures_presence) AS heures_presence, SUM(actif) AS actif',
+    retard: 'SUM(retard) AS retard',
     actif: 'SUM(actif) AS actif',
     present: 'SUM(present) AS present, SUM(actif) AS actif, ROUND(SUM(present)/NULLIF(SUM(actif),0)*100,2) AS taux_presence',
     delta: 'SUM(soll) AS soll, SUM(ist) AS ist, ROUND(SUM(ist)-SUM(soll),2) AS delta',
@@ -166,7 +185,32 @@ function formatResponse(rows, nlp) {
   const dl=fmtDate(agg.report_date), d=agg.delta>=0?'+':'';
 
   if (intent==='get_summary') {
-    const t={fr:`📊 *Résumé ${scope}*\n📅 ${dl}\n\n👥 Actif : ${fmt(agg.actif,0)} | Présents : ${fmt(agg.present,0)}\n❌ NP : ${fmt(agg.np,0)} (${fmt(agg.abs_np_rate)}%)\n🗓️ P : ${fmt(agg.p,0)} (${fmt(agg.abs_p_rate)}%)\n📊 Total Abs : ${fmt(agg.total_abs,0)}\n📋 SQ : ${fmt(agg.sq,0)} | AC : ${fmt(agg.ac,0)} | RV : ${fmt(agg.rv,0)}\n🏥 Maladie ML : ${fmt(agg.maladie,0)}\n⚠️ Mise/dem MD : ${fmt(agg.mise_en_demeure,0)}\n✅ Présence : ${fmt(agg.taux_presence)}%\n⏱️ H.Sup : ${fmt(agg.heures_sup,0)} | Retard : ${fmt(agg.retard,0)}`,ar:`📊 *ملخص ${scope}*\n📅 ${dl}\n\n👥 ${fmt(agg.actif,0)} | NP: ${fmt(agg.np,0)} (${fmt(agg.abs_np_rate)}%) | P: ${fmt(agg.p,0)} (${fmt(agg.abs_p_rate)}%)\n📊 Total: ${fmt(agg.total_abs,0)} | 🏥 ML: ${fmt(agg.maladie,0)} | ✅ ${fmt(agg.taux_presence)}%`,tn:`📊 *Résumé ${scope}*\n📅 ${dl}\n\n👥 ${fmt(agg.actif,0)} | NP: ${fmt(agg.np,0)} (${fmt(agg.abs_np_rate)}%) | P: ${fmt(agg.p,0)} (${fmt(agg.abs_p_rate)}%)\n📊 Total: ${fmt(agg.total_abs,0)} | ✅ ${fmt(agg.taux_presence)}%`};
+    const t={
+      fr:`📊 *Résumé ${scope}*\n📅 ${dl}\n\n` +
+         `👥 Actif : ${fmt(agg.actif,0)} | Présents : ${fmt(agg.present,0)}\n` +
+         `✅ Taux Présence : ${fmt(agg.taux_presence)}%\n\n` +
+         `❌ NP : ${fmt(agg.np,0)} (${fmt(agg.abs_np_rate)}%)\n` +
+         `🗓️ P  : ${fmt(agg.p,0)} (${fmt(agg.abs_p_rate)}%)\n` +
+         `📊 Total Abs : ${fmt(agg.total_abs,0)}\n\n` +
+         `📋 SQ : ${fmt(agg.sq,0)} | AC : ${fmt(agg.ac,0)} | RV : ${fmt(agg.rv,0)}\n\n` +
+         `🏥 ML (Maladie Prolongée) : ${fmt(agg.maladie,0)}\n` +
+         `🚪 MD (Mise en demeure / Quittement) : ${fmt(agg.mise_en_demeure,0)}\n` +
+         `⚠️ _ML et MD sont deux indicateurs séparés_\n\n` +
+         `⏱️ H.Sup : ${fmt(agg.heures_sup,0)} | ⏰ Retard : ${fmt(agg.retard,0)}`,
+      ar:`📊 *ملخص ${scope}*\n📅 ${dl}\n\n` +
+         `👥 العدد: ${fmt(agg.actif,0)} | الحضور: ${fmt(agg.present,0)} (${fmt(agg.taux_presence)}%)\n` +
+         `❌ NP: ${fmt(agg.np,0)} (${fmt(agg.abs_np_rate)}%) | 🗓️ P: ${fmt(agg.p,0)} (${fmt(agg.abs_p_rate)}%)\n` +
+         `📊 إجمالي: ${fmt(agg.total_abs,0)}\n` +
+         `🏥 ML (مرض طويل الأمد): ${fmt(agg.maladie,0)}\n` +
+         `🚪 MD (إنهاء عقد): ${fmt(agg.mise_en_demeure,0)}\n` +
+         `⏱️ إضافي: ${fmt(agg.heures_sup,0)} | تأخير: ${fmt(agg.retard,0)}`,
+      tn:`📊 *Résumé ${scope}*\n📅 ${dl}\n\n` +
+         `👥 ${fmt(agg.actif,0)} | Présents: ${fmt(agg.present,0)} (${fmt(agg.taux_presence)}%)\n` +
+         `NP: ${fmt(agg.np,0)} (${fmt(agg.abs_np_rate)}%) | P: ${fmt(agg.p,0)} (${fmt(agg.abs_p_rate)}%)\n` +
+         `Total: ${fmt(agg.total_abs,0)}\n` +
+         `ML (Maladie Prol.): ${fmt(agg.maladie,0)} | MD (Quittement): ${fmt(agg.mise_en_demeure,0)}\n` +
+         `H.Sup: ${fmt(agg.heures_sup,0)} | Retard: ${fmt(agg.retard,0)}`
+    };
     return t[lang]||t.fr;
   }
   if (intent==='top') {
@@ -179,14 +223,21 @@ function formatResponse(rows, nlp) {
     sq:{fr:`📋 *SQ — ${scope}*\n📅 ${dl}\n\n📋 SQ = ${fmt(agg.sq,0)}`,ar:`📋 *SQ*\n📅 ${dl}\n\nSQ = ${fmt(agg.sq,0)}`,tn:`📋 *SQ*\n📅 ${dl}\n\nSQ = ${fmt(agg.sq,0)}`},
     ac:{fr:`📋 *AC — ${scope}*\n📅 ${dl}\n\n🔁 AC = ${fmt(agg.ac,0)}`,ar:`📋 *AC*\n📅 ${dl}\n\nAC = ${fmt(agg.ac,0)}`,tn:`📋 *AC*\n📅 ${dl}\n\nAC = ${fmt(agg.ac,0)}`},
     rv:{fr:`📋 *RV — ${scope}*\n📅 ${dl}\n\n📌 RV = ${fmt(agg.rv,0)}`,ar:`📋 *RV*\n📅 ${dl}\n\nRV = ${fmt(agg.rv,0)}`,tn:`📋 *RV*\n📅 ${dl}\n\nRV = ${fmt(agg.rv,0)}`},
-    maladie:{fr:`🏥 *Maladie ML — ${scope}*\n📅 ${dl}\n\n🤒 ML = ${fmt(agg.maladie,0)}\n_(MD = Mise en demeure, indicateur séparé)_`,ar:`🏥 *مرض ML*\n📅 ${dl}\n\nML = ${fmt(agg.maladie,0)}`,tn:`🏥 *ML — ${scope}*\n📅 ${dl}\n\nML = ${fmt(agg.maladie,0)}`},
-    mise_en_demeure:{fr:`⚠️ *Mise en demeure MD — ${scope}*\n📅 ${dl}\n\n⚠️ MD = ${fmt(agg.mise_en_demeure,0)}\n_(ML = Maladie, indicateur séparé)_`,ar:`⚠️ *إنذار MD*\n📅 ${dl}\n\nMD = ${fmt(agg.mise_en_demeure,0)}`,tn:`⚠️ *MD — ${scope}*\n📅 ${dl}\n\nMD = ${fmt(agg.mise_en_demeure,0)}`},
+    maladie:{
+      fr:`🏥 *ML — Maladie Prolongée — ${scope}*\n📅 ${dl}\n\n🤒 ML (Maladie Prolongée) = ${fmt(agg.maladie,0)}\n\n⚠️ _ML ≠ MD : ML = maladie prolongée SEULEMENT\nMD = mise en demeure (quittement) — indicateur séparé_`,
+      ar:`🏥 *ML — مرض طويل الأمد — ${scope}*\n📅 ${dl}\n\n🤒 ML = ${fmt(agg.maladie,0)}\n_(ML = مرض فقط — MD = إنهاء عقد، مؤشر منفصل)_`,
+      tn:`🏥 *ML — Maladie Prolongée — ${scope}*\n📅 ${dl}\n\nML = ${fmt(agg.maladie,0)}\n_(ML ≠ MD: ML = maladie, MD = quittement)_`},
+    mise_en_demeure:{
+      fr:`⚠️ *MD — Mise en demeure (Quittement) — ${scope}*\n📅 ${dl}\n\n🚪 MD (Mise en demeure / Quittement) = ${fmt(agg.mise_en_demeure,0)}\n\n⚠️ _MD ≠ ML : MD = quittement SEULEMENT\nML = maladie prolongée — indicateur séparé_`,
+      ar:`⚠️ *MD — إنهاء عقد / إنذار — ${scope}*\n📅 ${dl}\n\n🚪 MD = ${fmt(agg.mise_en_demeure,0)}\n_(MD = إنهاء عقد فقط — ML = مرض، مؤشر منفصل)_`,
+      tn:`⚠️ *MD — Mise en demeure — ${scope}*\n📅 ${dl}\n\nMD = ${fmt(agg.mise_en_demeure,0)}\n_(MD ≠ ML: MD = quittement, ML = maladie)_`},
     abs_np_rate:{fr:`📊 *Taux NP — ${scope}*\n📅 ${dl}\n\n📉 Taux NP = ${fmt(agg.abs_np_rate)}%\n   NP = ${fmt(agg.np,0)} / Actif = ${fmt(agg.actif,0)}`,ar:`📊 *نسبة NP*\n📅 ${dl}\n\n📉 ${fmt(agg.abs_np_rate)}%`,tn:`📊 *Taux NP*\n📅 ${dl}\n\n📉 ${fmt(agg.abs_np_rate)}% (NP=${fmt(agg.np,0)})`},
     abs_p_rate:{fr:`📊 *Taux P — ${scope}*\n📅 ${dl}\n\n📉 Taux P = ${fmt(agg.abs_p_rate)}%\n   P = ${fmt(agg.p,0)} / Actif = ${fmt(agg.actif,0)}`,ar:`📊 *نسبة P*\n📅 ${dl}\n\n📉 ${fmt(agg.abs_p_rate)}%`,tn:`📊 *Taux P*\n📅 ${dl}\n\n📉 ${fmt(agg.abs_p_rate)}%`},
     total_abs:{fr:`📊 *Total Absences — ${scope}*\n📅 ${dl}\n\n👥 Actif : ${fmt(agg.actif,0)}\n❌ NP : ${fmt(agg.np,0)} | 🗓️ P : ${fmt(agg.p,0)}\n📊 Total Abs = ${fmt(agg.total_abs,0)}`,ar:`📊 *إجمالي الغيابات*\n📅 ${dl}\n\nNP=${fmt(agg.np,0)} | P=${fmt(agg.p,0)} | Total=${fmt(agg.total_abs,0)}`,tn:`📊 *Total Abs*\n📅 ${dl}\n\nNP=${fmt(agg.np,0)} | P=${fmt(agg.p,0)} | Total=${fmt(agg.total_abs,0)}`},
     taux_presence:{fr:`✅ *Taux Présence — ${scope}*\n📅 ${dl}\n\n✅ Taux = ${fmt(agg.taux_presence)}%\n   Présents = ${fmt(agg.present,0)} / Actif = ${fmt(agg.actif,0)}`,ar:`✅ *نسبة الحضور*\n📅 ${dl}\n\n✅ ${fmt(agg.taux_presence)}%`,tn:`✅ *Présence*\n📅 ${dl}\n\n✅ ${fmt(agg.taux_presence)}%`},
     delta:{fr:`⚖️ *Delta Soll/IST — ${scope}*\n📅 ${dl}\n\n🎯 Soll = ${fmt(agg.soll,0)}h\n✅ IST = ${fmt(agg.ist,0)}h\n📊 Delta = ${d}${fmt(agg.delta)}h`,ar:`⚖️ *Delta*\n📅 ${dl}\n\nDelta = ${d}${fmt(agg.delta)}h`,tn:`⚖️ *Delta*\n📅 ${dl}\n\n${d}${fmt(agg.delta)}h`},
     heures_sup:{fr:`⏱️ *Heures Sup — ${scope}*\n📅 ${dl}\n\n⏱️ H.Sup = ${fmt(agg.heures_sup,0)}h`,ar:`⏱️ *ساعات إضافية*\n📅 ${dl}\n\n${fmt(agg.heures_sup,0)}h`,tn:`⏱️ *H.Sup*\n📅 ${dl}\n\n${fmt(agg.heures_sup,0)}h`},
+    heures_presence:{fr:`🕐 *Heures Présence — ${scope}*\n📅 ${dl}\n\n🕐 H.Présence = ${fmt(parseFloat(rows[0]?.heures_presence)||agg.heures_presence,1)}h\n👥 Actif = ${fmt(agg.actif,0)}`,ar:`🕐 *ساعات الحضور — ${scope}*\n📅 ${dl}\n\n🕐 ${fmt(parseFloat(rows[0]?.heures_presence)||agg.heures_presence,1)}h`,tn:`🕐 *H.Présence*\n📅 ${dl}\n\n🕐 ${fmt(parseFloat(rows[0]?.heures_presence)||agg.heures_presence,1)}h`},
     retard:{fr:`⏰ *Retards — ${scope}*\n📅 ${dl}\n\n⏰ Retards = ${fmt(agg.retard,0)} cas`,ar:`⏰ *تأخيرات*\n📅 ${dl}\n\n${fmt(agg.retard,0)}`,tn:`⏰ *Retards*\n📅 ${dl}\n\n${fmt(agg.retard,0)} cas`},
     actif:{fr:`👥 *Effectif Actif — ${scope}*\n📅 ${dl}\n\n👥 Actif = ${fmt(agg.actif,0)}`,ar:`👥 *العدد*\n📅 ${dl}\n\n👥 ${fmt(agg.actif,0)}`,tn:`👥 *Actif*\n📅 ${dl}\n\n👥 ${fmt(agg.actif,0)}`},
     present:{fr:`✅ *Présents — ${scope}*\n📅 ${dl}\n\n✅ Présents = ${fmt(agg.present,0)} / ${fmt(agg.actif,0)}\n📈 Taux = ${fmt(agg.taux_presence)}%`,ar:`✅ *الحاضرون*\n📅 ${dl}\n\n✅ ${fmt(agg.present,0)}`,tn:`✅ *Présents*\n📅 ${dl}\n\n✅ ${fmt(agg.present,0)} / ${fmt(agg.actif,0)}`},
@@ -229,7 +280,7 @@ async function processMessage(sock, jid, text) {
     if (scope.type === 'plant') { scope = { type: user.allowed_scope_type, value: user.allowed_scope_value }; }
   }
 
-  const nlp = { metric, intent, language: lang, scope_type: scope.type, scope_value: scope.value, date_mode: date.mode, date: date.date };
+  const nlp = { metric, intent, language: lang, scope_type: scope.type, scope_value: scope.value, scope_process: scope.process||null, date_mode: date.mode, date: date.date };
   console.log(`   📊 NLP: ${intent} | ${metric} | ${scope.value} | ${date.mode} | ${lang}`);
 
   // SQL + réponse
