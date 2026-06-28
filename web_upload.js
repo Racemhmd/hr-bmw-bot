@@ -31,6 +31,30 @@ function parseJour(jour, year) {
   return null;
 }
 
+// ── Migration DB : ajoute colonne activite si manquante ──────────
+async function runMigration(client) {
+  try {
+    await client.query(`ALTER TABLE daily_hr_report ADD COLUMN IF NOT EXISTS activite VARCHAR(100) DEFAULT ''`);
+    await client.query(`ALTER TABLE daily_hr_report ADD COLUMN IF NOT EXISTS soll_raw NUMERIC(10,2) DEFAULT 0`);
+    await client.query(`ALTER TABLE daily_hr_report ADD COLUMN IF NOT EXISTS ist_raw NUMERIC(10,2) DEFAULT 0`);
+    // Mise à jour contrainte unique pour inclure activite
+    await client.query(`
+      DO $$ BEGIN
+        BEGIN
+          ALTER TABLE daily_hr_report DROP CONSTRAINT daily_hr_report_report_date_plant_group_name_key;
+        EXCEPTION WHEN undefined_object THEN NULL; END;
+        BEGIN
+          ALTER TABLE daily_hr_report ADD CONSTRAINT daily_hr_report_unique_v2
+            UNIQUE (report_date, plant, group_name, activite);
+        EXCEPTION WHEN duplicate_table THEN NULL; END;
+      END $$
+    `);
+    console.log('✅ Migration DB OK (activite, soll/ist colonnes)');
+  } catch(e) {
+    console.warn('⚠️ Migration warning:', e.message);
+  }
+}
+
 async function importHTML(htmlContent, filename) {
   const MARKER     = 'const initialRecords = ';
   const MARKER_END = ';\nlet currentRecords = [];';
@@ -41,6 +65,12 @@ async function importHTML(htmlContent, filename) {
 
   const rawRecords = JSON.parse(htmlContent.substring(si + MARKER.length, ei));
 
+  // Debug : afficher les champs disponibles dans le premier enregistrement
+  if (rawRecords.length > 0) {
+    console.log('🔍 Champs disponibles dans initialRecords:', Object.keys(rawRecords[0]).join(', '));
+    console.log('🔍 Sample record:', JSON.stringify(rawRecords[0]).substring(0, 300));
+  }
+
   const groups = {};
   let skipped = 0;
   for (const r of rawRecords) {
@@ -50,12 +80,27 @@ async function importHTML(htmlContent, filename) {
     if (!reportDate) { skipped++; continue; }
     const plant  = String(r.plant||'BMW U11').trim();
     const groupe = String(r.groupe||'').trim();
-    const key    = reportDate+'||'+plant+'||'+groupe;
+
+    // ── Extraction process/activité (Assembly, Electrical Test, CE...) ──
+    // Essaie plusieurs noms de champs possibles dans l'HTML
+    const activite = String(
+      r.activite || r.process || r.job || r.poste || r.tache ||
+      r.aktivitet || r.activity || r.process_type || r.job_type || ''
+    ).trim();
+
+    // ── Extraction Soll / IST (heures planifiées / réelles) ──
+    // Essaie plusieurs noms de champs possibles
+    const soll_v = +(r.soll || r.soll_h || r.soll_hours || r.planifie ||
+                     r.planned || r.planned_hours || r.sollzeit || 0);
+    const ist_v  = +(r.ist  || r.ist_h  || r.ist_hours  || r.reel ||
+                     r.heures_reel || r.h_reel || r.istzeit || 0);
+
+    const key = reportDate+'||'+plant+'||'+groupe+'||'+activite;
     if (!groups[key]) groups[key] = {
-      report_date:reportDate, plant, group_name:groupe,
+      report_date:reportDate, plant, group_name:groupe, activite,
       process:String(r.psm||'').trim(), circuit:String(r.segment||'').trim(), perimeter:plant,
-      actif:0,present:0,p:0,np:0,sq:0,ac:0,rv:0,ml:0,
-      heures_presence:0,heures_sup:0,retard:0,_rows:0
+      actif:0, present:0, p:0, np:0, sq:0, ac:0, rv:0, ml:0,
+      heures_presence:0, heures_sup:0, retard:0, soll:0, ist:0, _rows:0
     };
     const g = groups[key];
     g.actif+=+(r.actif||0); g.present+=+(r.present||0);
@@ -63,47 +108,58 @@ async function importHTML(htmlContent, filename) {
     g.ac+=+(r.ac||0); g.rv+=+(r.rv||0); g.ml+=+(r.ml||0);
     g.heures_presence+=+(r.presence_hours||0);
     g.heures_sup+=+(r.h_sup||0); g.retard+=+(r.retard||0);
+    g.soll+=soll_v; g.ist+=ist_v;
     g._rows++;
   }
 
   const rows = Object.values(groups);
   const dates = [...new Set(rows.map(r=>r.report_date))].sort();
 
+  // Log les activites détectées
+  const activites = [...new Set(rows.map(r=>r.activite).filter(Boolean))];
+  if (activites.length > 0) console.log('🏭 Activités détectées:', activites.join(', '));
+  else console.log('ℹ️ Aucune activité détectée (champ activite/process vide dans HTML)');
+
   const client = new Client({ connectionString: NEON_URL });
   await client.connect();
 
+  // Lancer la migration avant tout INSERT
+  await runMigration(client);
+
   const UPSERT = `INSERT INTO daily_hr_report (
-    report_date,plant,perimeter,process,circuit,group_name,
+    report_date,plant,perimeter,process,circuit,group_name,activite,
     actif,present,nb_abs,p,np,sq,ac,rv,ml,md,
     maladie,mise_en_demeure,abs_p_rate,abs_np_rate,total_abs,
     taux_presence,heures_presence,retard,heures_sup,
     soll,ist,delta,raw_json,source_file,uploaded_by
   ) VALUES ($1::date,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29::jsonb,$30,$31)
-  ON CONFLICT (report_date,plant,group_name) DO UPDATE SET
+  ON CONFLICT (report_date,plant,group_name,activite) DO UPDATE SET
     actif=EXCLUDED.actif,present=EXCLUDED.present,nb_abs=EXCLUDED.nb_abs,
     p=EXCLUDED.p,np=EXCLUDED.np,sq=EXCLUDED.sq,ac=EXCLUDED.ac,rv=EXCLUDED.rv,
     ml=EXCLUDED.ml,md=EXCLUDED.md,maladie=EXCLUDED.maladie,mise_en_demeure=EXCLUDED.mise_en_demeure,
     abs_p_rate=EXCLUDED.abs_p_rate,abs_np_rate=EXCLUDED.abs_np_rate,
     total_abs=EXCLUDED.total_abs,taux_presence=EXCLUDED.taux_presence,
     heures_presence=EXCLUDED.heures_presence,retard=EXCLUDED.retard,
-    heures_sup=EXCLUDED.heures_sup,source_file=EXCLUDED.source_file,raw_json=EXCLUDED.raw_json`;
+    heures_sup=EXCLUDED.heures_sup,soll=EXCLUDED.soll,ist=EXCLUDED.ist,delta=EXCLUDED.delta,
+    source_file=EXCLUDED.source_file,raw_json=EXCLUDED.raw_json`;
 
   let count = 0;
   for (const g of rows) {
     const ml=g.ml, md=0, p=g.p, np=g.np, actif=g.actif, present=g.present;
-    const r2 = v => parseFloat(v.toFixed(2));
+    const soll=g.soll, ist=g.ist;
+    const r2 = v => parseFloat((v||0).toFixed(2));
     await client.query(UPSERT, [
-      g.report_date,g.plant,g.perimeter,g.process,g.circuit,g.group_name,
-      actif,present,actif-present,p,np,g.sq,g.ac,g.rv,ml,md,
-      ml,md,
+      g.report_date, g.plant, g.perimeter, g.process, g.circuit, g.group_name, g.activite||'',
+      actif, present, actif-present, p, np, g.sq, g.ac, g.rv, ml, md,
+      ml, md,
       actif>0?r2(p/actif*100):0,
       actif>0?r2(np/actif*100):0,
       p+np,
       actif>0?r2(present/actif*100):0,
-      r2(g.heures_presence),r2(g.retard),r2(g.heures_sup),
-      0,0,0,
-      JSON.stringify({source:'web_upload',rows:g._rows}),
-      filename,'web_upload'
+      r2(g.heures_presence), r2(g.retard), r2(g.heures_sup),
+      r2(soll), r2(ist), r2(ist-soll),                         // RÉELS soll, ist, delta
+      JSON.stringify({source:'web_upload',rows:g._rows,activite:g.activite,soll,ist}),
+      filename, 'web_upload'
     ]);
     count++;
   }
@@ -113,7 +169,7 @@ async function importHTML(htmlContent, filename) {
     [filename, count]);
 
   await client.end();
-  return { rows: count, skipped, dates, rawRecords: rawRecords.length };
+  return { rows: count, skipped, dates, rawRecords: rawRecords.length, activites };
 }
 
 // ── Serveur HTTP ─────────────────────────────────────────────────

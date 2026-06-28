@@ -39,572 +39,671 @@ async function dbQuery(sql, params = []) {
   return res.rows;
 }
 
-// ── NLP ──────────────────────────────────────────────────────────
-function detectLang(t) {
-  if (/[؀-ۿ]/.test(t)) return 'ar';
+// ══════════════════════════════════════════════════════════════════
+// MOTEUR NLP DYNAMIQUE — HR BMW U11
+// Lit toujours les données du dernier rapport uploadé
+// ══════════════════════════════════════════════════════════════════
+
+// ── 1. REGISTRE DES MÉTRIQUES ────────────────────────────────────
+// Ordonné du plus spécifique au moins spécifique
+// agg: SUM | RATE | SPECIAL | null(summary)
+const METRIC_REGISTRY = [
+  // Delta / Soll / IST
+  { patterns:[/\bdelta\b|écart|ecart|ist[\s\-]*soll|soll[\s\-]*ist|différence|difference/],
+    metric:'delta', col:'delta', selCols:'SUM(soll) AS soll,SUM(ist) AS ist,ROUND(SUM(ist)-SUM(soll),2) AS val,SUM(actif) AS actif',
+    label:'Delta (IST−Soll)', unit:'h', agg:'SUM' },
+  { patterns:[/\bsoll\b|objectif\b|target\b|planifi[eé]\b|prévu\b|prevu\b/],
+    metric:'soll', col:'soll', selCols:'SUM(soll) AS val,SUM(ist) AS ist,ROUND(SUM(ist)-SUM(soll),2) AS delta,SUM(actif) AS actif',
+    label:'Soll (Planifié)', unit:'h', agg:'SUM' },
+  { patterns:[/\bist\b(?!\s*[a-z])|réalisé\b|realise\b|actuel\b(?!\s*(?:lement|s\b))/],
+    metric:'ist', col:'ist', selCols:'SUM(ist) AS val,SUM(soll) AS soll,ROUND(SUM(ist)-SUM(soll),2) AS delta,SUM(actif) AS actif',
+    label:'IST (Réalisé)', unit:'h', agg:'SUM' },
+
+  // Taux
+  { patterns:[/taux\s*np|%\s*np|taux\s*abs\s*np|pourcentage\s*np/],
+    metric:'abs_np_rate', col:'np', selCols:'SUM(np) AS np,SUM(actif) AS actif,ROUND(SUM(np)/NULLIF(SUM(actif),0)*100,2) AS val',
+    label:'Taux NP', unit:'%', agg:'RATE' },
+  { patterns:[/taux\s*\bp\b|taux\s*abs\s*p\b|pourcentage\s*\bp\b/],
+    metric:'abs_p_rate', col:'p', selCols:'SUM(p) AS p,SUM(actif) AS actif,ROUND(SUM(p)/NULLIF(SUM(actif),0)*100,2) AS val',
+    label:'Taux P', unit:'%', agg:'RATE' },
+  { patterns:[/taux\s*pr[eé]s|taux\s*presence|%\s*présence|taux\s*de\s*présence/],
+    metric:'taux_presence', col:'present', selCols:'SUM(present) AS present,SUM(actif) AS actif,ROUND(SUM(present)/NULLIF(SUM(actif),0)*100,2) AS val',
+    label:'Taux Présence', unit:'%', agg:'RATE' },
+
+  // ML / MD (avant "maladie" générique)
+  { patterns:[/\bml\b|maladie\s*prol|مرض\s*طويل/],
+    metric:'maladie', col:'ml', selCols:'SUM(ml) AS val',
+    label:'ML (Maladie Prolongée)', unit:'', agg:'SUM' },
+  { patterns:[/\bmd\b|mise\s*en\s*demeure|fluctuation|إنذار/],
+    metric:'mise_en_demeure', col:'md', selCols:'SUM(md) AS val',
+    label:'MD (Fluctuation/Mise en demeure)', unit:'', agg:'SUM' },
+
+  // Heures
+  { patterns:[/heures?\s*pr[eé]s|h\.pres\b|hpres\b|h\s*présence|heures?\s*trav|ساعات\s*حضور/],
+    metric:'heures_presence', col:'heures_presence', selCols:'SUM(heures_presence) AS val,SUM(actif) AS actif',
+    label:'Heures Présence', unit:'h', agg:'SUM' },
+  { patterns:[/h\s*sup\b|heures?\s*sup|heures?\s*supp|overtime|ساعات\s*إضافية/],
+    metric:'heures_sup', col:'heures_sup', selCols:'SUM(heures_sup) AS val',
+    label:'Heures Sup', unit:'h', agg:'SUM' },
+
+  // Absences spécifiques
+  { patterns:[/\bnp\b|absence\s*np|non\s*planif|non\s*justif|غياب\s*np|غياب\s*غير\s*مبرر/],
+    metric:'np', col:'np', selCols:'SUM(np) AS val,SUM(actif) AS actif,ROUND(SUM(np)/NULLIF(SUM(actif),0)*100,2) AS pct',
+    label:'Absence NP', unit:'', agg:'SUM' },
+  { patterns:[/\bac\b|absence\s*continue/],
+    metric:'ac', col:'ac', selCols:'SUM(ac) AS val',
+    label:'AC', unit:'', agg:'SUM' },
+  { patterns:[/\bsq\b|sans\s*questionnaire/],
+    metric:'sq', col:'sq', selCols:'SUM(sq) AS val',
+    label:'SQ', unit:'', agg:'SUM' },
+  { patterns:[/\brv\b|renvoi\b/],
+    metric:'rv', col:'rv', selCols:'SUM(rv) AS val',
+    label:'RV (Renvoi)', unit:'', agg:'SUM' },
+  { patterns:[/\bp\b(?!gtf|res|la|ou|ar|ar)|absence\s*p\b|planifi[eé]e?\b(?!\s*(?:heures|soll))|غياب\s*مبرر/],
+    metric:'p', col:'p', selCols:'SUM(p) AS val,SUM(actif) AS actif,ROUND(SUM(p)/NULLIF(SUM(actif),0)*100,2) AS pct',
+    label:'Absence P', unit:'', agg:'SUM' },
+
+  // Présents / Actif
+  { patterns:[/\bpr[eé]sent|حضور\b/],
+    metric:'present', col:'present', selCols:'SUM(present) AS val,SUM(actif) AS actif,ROUND(SUM(present)/NULLIF(SUM(actif),0)*100,2) AS pct',
+    label:'Présents', unit:'', agg:'SUM' },
+  { patterns:[/\bactif\b|\beffectif\b|\bhc\b(?!\s*\d)|nombre\s*employ|nombre\s*op[eé]r|headcount/],
+    metric:'actif', col:'actif', selCols:'SUM(actif) AS val,SUM(present) AS present',
+    label:'Effectif Actif', unit:'', agg:'SUM' },
+  { patterns:[/retard\b|late\b/],
+    metric:'retard', col:'retard', selCols:'SUM(retard) AS val',
+    label:'Retards', unit:'', agg:'SUM' },
+  { patterns:[/\bmaladie\b/],
+    metric:'maladie', col:'ml', selCols:'SUM(ml) AS val',
+    label:'ML (Maladie Prolongée)', unit:'', agg:'SUM' },
+
+  // Résumé
+  { patterns:[/r[eé]sum[eé]|ملخص|tous\s*les\s*indicateurs|chiffres|kpi\b|bilan\b|overview|indicateurs\s*de/],
+    metric:'summary', col:null, selCols:null,
+    label:'Résumé Complet', unit:'', agg:null },
+
+  // Total abs (fallback absences — DOIT être explicite dans la question)
+  { patterns:[/total\s*abs|abs\s*total|absence\s*total|إجمالي\s*الغياب|total\s*absences/],
+    metric:'total_abs', col:'total_abs', selCols:'SUM(total_abs) AS val,SUM(np) AS np,SUM(p) AS p,SUM(actif) AS actif',
+    label:'Total Absences', unit:'', agg:'SUM' },
+];
+
+// Colonnes SELECT pour le résumé complet
+const SUMMARY_COLS = `SUM(actif) AS actif,SUM(present) AS present,SUM(np) AS np,SUM(p) AS p,
+  SUM(sq) AS sq,SUM(ac) AS ac,SUM(rv) AS rv,SUM(ml) AS maladie,SUM(md) AS mise_en_demeure,
+  SUM(total_abs) AS total_abs,SUM(heures_presence) AS heures_presence,
+  SUM(heures_sup) AS heures_sup,SUM(retard) AS retard,
+  SUM(soll) AS soll,SUM(ist) AS ist,ROUND(SUM(ist)-SUM(soll),2) AS delta,
+  ROUND(SUM(np)/NULLIF(SUM(actif),0)*100,2) AS abs_np_rate,
+  ROUND(SUM(p)/NULLIF(SUM(actif),0)*100,2) AS abs_p_rate,
+  ROUND(SUM(present)/NULLIF(SUM(actif),0)*100,2) AS taux_presence`;
+
+// Métrique par défaut si un process/activite est détecté sans mot-clé métrique
+const PROCESS_DEFAULT  = { metric:'delta', col:'delta',
+  selCols:'SUM(soll) AS soll,SUM(ist) AS ist,ROUND(SUM(ist)-SUM(soll),2) AS val,SUM(actif) AS actif',
+  label:'Delta/Soll/IST', unit:'h', agg:'SUM' };
+const PROCESS_EFFECTIF = { metric:'actif', col:'actif',
+  selCols:'SUM(actif) AS val,SUM(present) AS present',
+  label:'Effectif Actif', unit:'', agg:'SUM' };
+
+// ── 2. PATTERNS DE FILTRES ────────────────────────────────────────
+const CIRCUIT_PATTERNS = [
+  [/pgtf[\s\-]?1/i,'PGTF-1'],[/pgtf[\s\-]?2/i,'PGTF-2'],[/pgtf[\s\-]?3/i,'PGTF-3'],
+  [/\bpgtf\b/i,'%PGTF%'],[/shelf/i,'Shelf'],[/\bwpa\b/i,'WPA'],[/\bbasis\b/i,'Basis'],
+  [/rework|zone.?rework/i,'%ework%'],[/seg.?circuit/i,'Seg Circuit'],
+  [/\bmuster\b/i,'Muster'],[/\bformation\b/i,'%ormation%'],[/non.?affect/i,'%Non%affect%'],
+  [/\bcircuit\b(?!.*seg)/i,'Circuit'],
+];
+const PROCESS_ACT_PATTERNS = [
+  [/electrical\s*test|elec\s*test|test\s*electr/i,'Electrical Test'],
+  [/\bassembl/i,'Assembly'],[/\bce\b|câblag|cablag/i,'CE'],
+  [/rework|retravail/i,'Rework'],[/manutent/i,'Manutention'],
+  [/visual|controle.?vis/i,'Visual'],[/logistic|logistiq/i,'Logistique'],
+  [/\btest\b(?!\s*(electr|soll|ist|delta|clé|kpi))/i,'Test'],
+];
+const AREA_PATTERNS = [
+  [/mabrouk|abdelhamid|ho\s*1|area\s*1|zone\s*pgtf/i,'%mabrouk%'],
+  [/laarabi|laarbi|mustpha|moustfa|ho\s*2|area\s*2|zone\s*(shelf|wpa|basis)/i,'%laarabi%'],
+];
+
+// ── 3. FONCTIONS DE BASE ──────────────────────────────────────────
+function normalizeText(text) {
+  return text.toLowerCase()
+    .normalize('NFD').replace(/[̀-ͯ]/g,'')  // supprimer accents
+    .replace(/[''`]/g,"'").replace(/\s+/g,' ').trim();
+}
+
+function detectLang(raw) {
+  if (/[؀-ۿ]/.test(raw)) return 'ar';
   const tn = ['a3tini','9adech','chnowa','chkoun','mta3','lyoum','barsha','waqteh','akther','fih','bech','3andek'];
-  if (tn.some(w => t.includes(w))) return 'tn';
+  if (tn.some(w => raw.toLowerCase().includes(w))) return 'tn';
   return 'fr';
 }
 
-function detectDate(t) {
-  const iso = t.match(/(\d{4}-\d{2}-\d{2})/);
-  if (iso) return { mode: 'specific', date: iso[0] };
-  const dmy = t.match(/(\d{1,2})[/\-](\d{1,2})[/\-](\d{4})/);
-  if (dmy) return { mode: 'specific', date: `${dmy[3]}-${dmy[2].padStart(2,'0')}-${dmy[1].padStart(2,'0')}` };
-  if (/aujourd|lyoum|اليوم|today/.test(t)) return { mode: 'latest' };
-  if (/hier|امس|yesterday/.test(t)) return { mode: 'yesterday' };
-  return { mode: 'latest' };
+// ── 4. DÉTECTION DATE ────────────────────────────────────────────
+function detectDate(n) {
+  const iso = n.match(/(\d{4}-\d{2}-\d{2})/);
+  if (iso) return { mode:'specific', date:iso[0] };
+  const dmy = n.match(/(\d{1,2})[/\-](\d{1,2})[/\-](\d{4})/);
+  if (dmy) return { mode:'specific', date:`${dmy[3]}-${dmy[2].padStart(2,'0')}-${dmy[1].padStart(2,'0')}` };
+  if (/aujourd|lyoum|اليوم|today/.test(n)) return { mode:'latest' };
+  if (/hier|امس|yesterday/.test(n))        return { mode:'yesterday' };
+  return { mode:'latest' };
 }
 
-function detectMetric(t) {
-  if (/taux.*np|pourcentage.*np|taux abs np|abs np rate/.test(t)) return 'abs_np_rate';
-  if (/taux.*\bp\b|taux abs p|abs p rate/.test(t)) return 'abs_p_rate';
-  if (/taux.*pré|taux.*presence/.test(t)) return 'taux_presence';
-  if (/\bnp\b|absence np|non plan/.test(t)) return 'np';
-  if (/\bp\b|absence planif|abs p/.test(t) && !/np/.test(t)) return 'p';
-  if (/\bsq\b|sans questionnaire/.test(t)) return 'sq';
-  if (/\bac\b|absence continue/.test(t)) return 'ac';
-  if (/\brv\b|rendez.vous|renvoi/.test(t)) return 'rv';
-  // ML = Maladie Prolongée SEULEMENT — jamais mélanger avec MD
-  if (/\bml\b|maladie prol|مرض طويل|مرض مطوّل/.test(t) && !/mise en demeure|\bmd\b|quitt|démiss/.test(t)) return 'maladie';
-  if (/maladie/.test(t) && !/mise en demeure|\bmd\b|quitt|démiss/.test(t)) return 'maladie';
-  // MD = Mise en demeure (fluctuation) SEULEMENT — jamais mélanger avec ML
-  if (/\bmd\b|mise en demeure|fluctuation|إنذار|إنهاء عقد/.test(t)) return 'mise_en_demeure';
-  if (/\bdelta\b|soll.*ist|ist.*soll|écart/.test(t)) return 'delta';
-  if (/h.*sup|heures sup/.test(t)) return 'heures_sup';
-  if (/heures.*pré|heures.*pres|h\.pres|hpres|وقت الحضور|ساعات الحضور/.test(t)) return 'heures_presence';
-  if (/retard/.test(t)) return 'retard';
-  if (/actif|effectif/.test(t) && !/absence/.test(t)) return 'actif';
-  if (/présent|present/.test(t) && !/taux/.test(t)) return 'present';
-  if (/résumé|resume|ملخص|tous.*indicateurs|chiffres/.test(t)) return 'summary';
-  return 'total_abs';
-}
-
-// ── Détection Circuit (colonne circuit dans DB) ──────────────────
-// Circuits réels : PGTF-1, PGTF-2, PGTF-3, Shelf, WPA, Basis,
-//                  Circuit, Seg Circuit, Rework Area, Zone Rework,
-//                  Muster, Formation, Non Affecté
-function detectCircuitName(t) {
-  if (/pgtf[\s\-]?1/.test(t)) return 'PGTF-1';
-  if (/pgtf[\s\-]?2/.test(t)) return 'PGTF-2';
-  if (/pgtf[\s\-]?3/.test(t)) return 'PGTF-3';
-  if (/\bpgtf\b/.test(t)) return '%PGTF%';          // tous PGTF
-  if (/\bshelf\b/.test(t)) return 'Shelf';
-  if (/\bwpa\b/.test(t)) return 'WPA';
-  if (/\bbasis\b/.test(t)) return 'Basis';
-  if (/rework|zone.?rework/.test(t)) return '%ework%';
-  if (/seg.?circuit/.test(t)) return 'Seg Circuit';
-  if (/\bcircuit\b/.test(t) && !/seg/.test(t)) return 'Circuit';
-  if (/\bmuster\b/.test(t)) return 'Muster';
-  if (/\bformation\b/.test(t)) return '%ormation%';
-  if (/non.?affect/.test(t)) return '%Non%affect%';
-  return null;
-}
-
-// ── Détection Area/Process (colonne process = nom responsable) ───
-// Areas : Abdelhamid Mabrouk (PGTF zone), Mustpha Laarabi (Shelf/WPA/Basis zone)
-function detectAreaName(t) {
-  if (/mabrouk|abdelhamid/.test(t)) return '%mabrouk%';
-  if (/laarabi|laarbi|mustpha|moustfa/.test(t)) return '%laarabi%';
-  // HO + numéro/zone
-  if (/ho\s*1|area\s*1|zone\s*pgtf/.test(t)) return '%mabrouk%';
-  if (/ho\s*2|area\s*2|zone\s*(shelf|wpa|basis)/.test(t)) return '%laarabi%';
-  return null;
-}
-
-function detectScope(t) {
-  // Groupe G-XXX ou G-XXX-Y
-  const g = t.match(/\b(g[-.]?\d{3,4}(?:[-.]?\d)?)\b/i);
-  const circName = detectCircuitName(t);
-  const areaName = detectAreaName(t);
-
-  if (g) {
-    // Groupe seul ou groupe + circuit
-    return { type: 'group_name', value: g[0].replace(/\./g,'-').toUpperCase(), process: areaName, circuit: circName };
-  }
-  if (circName) {
-    // Circuit spécifique (PGTF-1, Shelf, WPA...)
-    return { type: 'circuit', value: circName, process: areaName, circuit: circName };
-  }
-  if (areaName) {
-    // Area (Mabrouk / Laarabi)
-    return { type: 'area', value: areaName, process: areaName, circuit: null };
-  }
-  return { type: 'plant', value: 'BMW U11', process: null, circuit: null };
-}
-
-function detectTwoDates(t) {
+function detectTwoDates(n) {
   const found = [];
   const dmyRe = /(\d{1,2})[/\-](\d{1,2})(?:[/\-](\d{4}))?/g;
   let m;
-  while ((m = dmyRe.exec(t)) !== null) {
+  while ((m = dmyRe.exec(n)) !== null) {
     const y = m[3] || String(new Date().getFullYear());
     found.push(`${y}-${m[2].padStart(2,'0')}-${m[1].padStart(2,'0')}`);
   }
   const isoRe = /(\d{4}-\d{2}-\d{2})/g;
-  while ((m = isoRe.exec(t)) !== null) {
-    if (!found.includes(m[1])) found.push(m[1]);
-  }
-  if (found.length >= 2) return { date1: found[0], date2: found[1] };
+  while ((m = isoRe.exec(n)) !== null) { if (!found.includes(m[1])) found.push(m[1]); }
+  if (found.length >= 2) return { date1:found[0], date2:found[1] };
   return null;
 }
 
-function detectIntent(t, metric) {
-  if (metric === 'summary') return 'get_summary';
-  if (/best\s*employ|أفضل\s*عامل|meilleur.*employ|critère.*best|best.*critère/.test(t)) return 'best_employee';
-  if (/best\s*team|أفضل\s*فريق|meilleur.*équipe|best.*team.*critère|critère.*best.*team/.test(t)) return 'best_team';
-  if (/top|classement|le plus|plus.*abs/.test(t)) return 'top';
-  if (/compar|évolution|evolution|vs\b|entre.*et|n-1|jour.*(précédent|avant)/.test(t)) return 'compare';
-  // "groupes de Shelf/WPA/Basis/PGTF" → list groupes filtrés par circuit
-  if (/groupe.*de\s+(shelf|wpa|basis|pgtf)|les\s+groupe.*\b(shelf|wpa|basis|pgtf)\b/.test(t)) return 'list_group';
-  if (/chaque\s+groupe|tous\s+les\s+groupe|par\s+groupe|each\s+group/.test(t)) return 'list_group';
-  if (/chaque\s+(area|ho)|par\s+(area|ho)|tous\s+les\s+(area|ho)/.test(t)) return 'list_area';
-  // "par PGTF" avec détail → list circuits filtrés PGTF
-  if (/par\s+pgtf|pgtf.*(1.*2|2.*3|breakdown|détail)/.test(t)) return 'list_circuit';
-  if (/chaque\s+(process|circuit)|par\s+(process|circuit)/.test(t)) return 'list_circuit';
+// ── 5. DÉTECTION MÉTRIQUE ────────────────────────────────────────
+function mapMetricToColumn(n) {
+  for (const entry of METRIC_REGISTRY) {
+    if (entry.patterns.some(re => re.test(n))) return entry;
+  }
+  return null; // aucune métrique spécifique trouvée
+}
+
+// ── 6. DÉTECTION FILTRES ─────────────────────────────────────────
+function detectFilters(n) {
+  const filters = { group:null, circuit:null, activite:null, area:null };
+  // Groupe G-XXX
+  const g = n.match(/\b(g[-.]?\d{3,4}(?:[-.]?\d)?)\b/i);
+  if (g) filters.group = g[0].replace(/\./g,'-').toUpperCase();
+  // Circuit / Zone
+  for (const [re, val] of CIRCUIT_PATTERNS) { if (re.test(n)) { filters.circuit = val; break; } }
+  // Process / Activité
+  for (const [re, val] of PROCESS_ACT_PATTERNS) { if (re.test(n)) { filters.activite = val; break; } }
+  // Area (responsable)
+  for (const [re, val] of AREA_PATTERNS) { if (re.test(n)) { filters.area = val; break; } }
+  return filters;
+}
+
+// ── 7. DÉTECTION INTENTION ───────────────────────────────────────
+function detectIntent(n, metricDef) {
+  if (!metricDef) return 'get_metric';
+  if (metricDef.metric === 'summary') return 'summary';
+  if (/best\s*employ|أفضل\s*عامل|critere.*best|meilleur.*employ/.test(n)) return 'best_employee';
+  if (/best\s*team|أفضل\s*فريق|critere.*best.*team|meilleur.*equipe/.test(n)) return 'best_team';
+  if (/\btop\b|classement|le\s*plus|plus.*abs|le.*plus.*grand/.test(n)) return 'top';
+  if (/compar|evolution|vs\b|entre.*et|n-1|jour.*(precedent|avant)/.test(n)) return 'compare';
+  if (/groupe.*de\s*(shelf|wpa|basis|pgtf)|chaque\s*groupe|tous\s*les\s*groupe|par\s*groupe/.test(n)) return 'list_group';
+  if (/chaque\s*(area|ho)|par\s*(area|ho)|tous\s*les\s*(area|ho)/.test(n)) return 'list_area';
+  if (/par\s*pgtf|pgtf.*(1.*2|detail)|chaque\s*(process|circuit)|par\s*(process|circuit)/.test(n)) return 'list_circuit';
   return 'get_metric';
 }
 
-// ── SQL Builder ──────────────────────────────────────────────────
-function dateExprSQL(date_mode, date) {
-  if (date_mode === 'specific' && date) return `'${date}'::date`;
-  if (date_mode === 'yesterday') return "CURRENT_DATE - INTERVAL '1 day'";
+// ── 8. CONSTRUCTION SQL DYNAMIQUE ────────────────────────────────
+function dateExprSQL(mode, date) {
+  if (mode === 'specific' && date) return `'${date}'::date`;
+  if (mode === 'yesterday') return "CURRENT_DATE - INTERVAL '1 day'";
   return '(SELECT MAX(report_date) FROM daily_hr_report)';
 }
 
-function buildSQL(nlp) {
-  const { metric, scope_type, scope_value, scope_process, scope_circuit, date_mode, date, intent } = nlp;
-  const dateExpr = dateExprSQL(date_mode, date);
-
-  // Déterminer colonne de groupement et filtre selon scope_type
-  let col, filter;
-  const safe = v => (v||'').replace(/'/g,"''");
-
-  if (scope_type === 'group_name') {
-    col = 'group_name';
-    filter = `group_name ILIKE '${safe(scope_value)}'`;
-    if (nlp.scope_circuit) filter += ` AND circuit ILIKE '${safe(nlp.scope_circuit)}'`;
-    if (nlp.scope_process) filter += ` AND process ILIKE '${safe(nlp.scope_process)}'`;
-  } else if (scope_type === 'circuit') {
-    col = 'circuit';
-    // Supporte les wildcards % dans la valeur
-    filter = `plant ILIKE 'BMW U11' AND circuit ILIKE '${safe(scope_value)}'`;
-    if (nlp.scope_process) filter += ` AND process ILIKE '${safe(nlp.scope_process)}'`;
-  } else if (scope_type === 'area') {
-    col = 'process';
-    filter = `plant ILIKE 'BMW U11' AND process ILIKE '${safe(scope_value)}'`;
-  } else {
-    col = 'plant';
-    filter = `plant ILIKE 'BMW U11'`;
-    if (nlp.scope_circuit) filter += ` AND circuit ILIKE '${safe(nlp.scope_circuit)}'`;
-    if (nlp.scope_process) filter += ` AND process ILIKE '${safe(nlp.scope_process)}'`;
-  }
-
-  // ── Requêtes LIST (chaque groupe / area / circuit) ─────────────
-  const listColMap = { list_group:'group_name', list_area:'process', list_circuit:'circuit' };
-  if (listColMap[intent]) {
-    const listCol = listColMap[intent];
-    const metricColMap = {
-      np:'SUM(np) AS value, SUM(actif) AS actif',
-      p:'SUM(p) AS value, SUM(actif) AS actif',
-      sq:'SUM(sq) AS value', ac:'SUM(ac) AS value', rv:'SUM(rv) AS value',
-      maladie:'SUM(ml) AS value', mise_en_demeure:'SUM(md) AS value',
-      abs_np_rate:'SUM(np) AS np, SUM(actif) AS actif, ROUND(SUM(np)/NULLIF(SUM(actif),0)*100,2) AS value',
-      abs_p_rate:'SUM(p) AS p, SUM(actif) AS actif, ROUND(SUM(p)/NULLIF(SUM(actif),0)*100,2) AS value',
-      taux_presence:'SUM(present) AS present, SUM(actif) AS actif, ROUND(SUM(present)/NULLIF(SUM(actif),0)*100,2) AS value',
-      total_abs:'SUM(total_abs) AS value, SUM(np) AS np, SUM(p) AS p',
-      actif:'SUM(actif) AS value',
-      present:'SUM(present) AS value, SUM(actif) AS actif',
-      heures_sup:'SUM(heures_sup) AS value',
-      heures_presence:'SUM(heures_presence) AS value',
-      retard:'SUM(retard) AS value',
-      delta:'SUM(soll) AS soll, SUM(ist) AS ist, ROUND(SUM(ist)-SUM(soll),2) AS value',
-    };
-    const listSel = metricColMap[metric] || 'SUM(total_abs) AS value, SUM(np) AS np, SUM(p) AS p';
-    // Filtre circuit/process optionnel pour list_group (ex: groupes de Shelf)
-    let listFilter = `plant ILIKE 'BMW U11'`;
-    if (scope_circuit && (intent === 'list_group' || intent === 'list_circuit')) {
-      listFilter += ` AND circuit ILIKE '${safe(scope_circuit)}'`;
-    }
-    if (scope_process && intent === 'list_group') {
-      listFilter += ` AND process ILIKE '${safe(scope_process)}'`;
-    }
-    return `SELECT ${listCol} AS scope_label, ${listSel}
-      FROM daily_hr_report WHERE report_date = ${dateExpr} AND ${listFilter}
-      GROUP BY ${listCol} ORDER BY value DESC NULLS LAST LIMIT 30`;
-  }
-
-  if (intent === 'get_summary') {
-    return `SELECT report_date, ${col} AS scope_label,
-      SUM(actif) AS actif, SUM(present) AS present, SUM(nb_abs) AS nb_abs,
-      SUM(p) AS p, SUM(np) AS np, SUM(sq) AS sq, SUM(ac) AS ac, SUM(rv) AS rv,
-      SUM(ml) AS maladie, SUM(md) AS mise_en_demeure, SUM(total_abs) AS total_abs,
-      ROUND(SUM(np)/NULLIF(SUM(actif),0)*100,2) AS abs_np_rate,
-      ROUND(SUM(p)/NULLIF(SUM(actif),0)*100,2) AS abs_p_rate,
-      ROUND(SUM(present)/NULLIF(SUM(actif),0)*100,2) AS taux_presence,
-      SUM(retard) AS retard, SUM(heures_sup) AS heures_sup
-      FROM daily_hr_report WHERE report_date = ${dateExpr} AND ${filter}
-      GROUP BY report_date, ${col}`;
-  }
-  if (intent === 'top') {
-    const c = metric === 'maladie' ? 'ml' : metric === 'mise_en_demeure' ? 'md' : metric;
-    return `SELECT report_date, ${col} AS scope_label, SUM(${c}) AS value, SUM(actif) AS actif
-      FROM daily_hr_report WHERE report_date = ${dateExpr} AND ${filter}
-      GROUP BY report_date, ${col} ORDER BY value DESC NULLS LAST LIMIT 5`;
-  }
-  const selectMap = {
-    np: 'SUM(np) AS np, SUM(actif) AS actif, ROUND(SUM(np)/NULLIF(SUM(actif),0)*100,2) AS abs_np_rate',
-    p: 'SUM(p) AS p, SUM(actif) AS actif, ROUND(SUM(p)/NULLIF(SUM(actif),0)*100,2) AS abs_p_rate',
-    sq: 'SUM(sq) AS sq', ac: 'SUM(ac) AS ac', rv: 'SUM(rv) AS rv',
-    maladie: 'SUM(ml) AS maladie',
-    mise_en_demeure: 'SUM(md) AS mise_en_demeure',
-    abs_np_rate: 'SUM(np) AS np, SUM(actif) AS actif, ROUND(SUM(np)/NULLIF(SUM(actif),0)*100,2) AS abs_np_rate',
-    abs_p_rate: 'SUM(p) AS p, SUM(actif) AS actif, ROUND(SUM(p)/NULLIF(SUM(actif),0)*100,2) AS abs_p_rate',
-    total_abs: 'SUM(total_abs) AS total_abs, SUM(p) AS p, SUM(np) AS np, SUM(actif) AS actif',
-    taux_presence: 'SUM(present) AS present, SUM(actif) AS actif, ROUND(SUM(present)/NULLIF(SUM(actif),0)*100,2) AS taux_presence',
-    heures_sup: 'SUM(heures_sup) AS heures_sup',
-    heures_presence: 'SUM(heures_presence) AS heures_presence, SUM(actif) AS actif',
-    retard: 'SUM(retard) AS retard',
-    actif: 'SUM(actif) AS actif',
-    present: 'SUM(present) AS present, SUM(actif) AS actif, ROUND(SUM(present)/NULLIF(SUM(actif),0)*100,2) AS taux_presence',
-    delta: 'SUM(soll) AS soll, SUM(ist) AS ist, ROUND(SUM(ist)-SUM(soll),2) AS delta',
-  };
-  const sel = selectMap[metric] || 'SUM(total_abs) AS total_abs, SUM(p) AS p, SUM(np) AS np';
-  return `SELECT report_date, ${col} AS scope_label, ${sel}
-    FROM daily_hr_report WHERE report_date = ${dateExpr} AND ${filter}
-    GROUP BY report_date, ${col}`;
+function buildScopeLabel(filters) {
+  const parts = [];
+  if (filters.activite) parts.push(filters.activite);
+  if (filters.group)    parts.push(filters.group);
+  else if (filters.circuit) parts.push(filters.circuit.replace(/%/g,'').trim());
+  else if (filters.area)    parts.push(filters.area.replace(/%/g,'').trim());
+  else parts.push('BMW U11');
+  return parts.join(' — ');
 }
 
-// ── Formater Réponse ─────────────────────────────────────────────
-function fmt(v, dec=1) { return (v==null) ? 'N/D' : Number(v).toFixed(dec); }
+function buildDynamicSQL(filters, metricDef, intent, dateMode, dateVal) {
+  const dateExpr = dateExprSQL(dateMode, dateVal);
+  const safe = v => (v||'').replace(/'/g,"''");
+
+  // Construire le WHERE
+  const where = [
+    `plant ILIKE 'BMW U11'`,
+    `report_date = ${dateExpr}`,
+    filters.group    ? `group_name ILIKE '${safe(filters.group)}'`   : null,
+    filters.circuit  ? `circuit ILIKE '${safe(filters.circuit)}'`     : null,
+    filters.activite ? `activite ILIKE '${safe(filters.activite)}'`   : null,
+    filters.area     ? `process ILIKE '${safe(filters.area)}'`        : null,
+  ].filter(Boolean).join(' AND ');
+
+  // Colonnes SELECT
+  const selCols = metricDef.metric === 'summary' ? SUMMARY_COLS : metricDef.selCols;
+
+  // Colonnes SELECT pour liste (besoin d'un alias 'val' pour ORDER BY)
+  const listSelCols = metricDef.metric === 'summary'
+    ? `SUM(total_abs) AS val, ${SUMMARY_COLS}`
+    : (metricDef.selCols.includes('AS val') ? metricDef.selCols : `${metricDef.selCols},SUM(total_abs) AS val`);
+
+  // ── LISTE : par groupe / area / circuit ───────────────────────
+  if (['list_group','list_area','list_circuit'].includes(intent)) {
+    const groupCol = intent==='list_group'? 'group_name' : intent==='list_area'? 'process' : 'circuit';
+    return `SELECT report_date, ${groupCol} AS scope_label, ${listSelCols}
+      FROM daily_hr_report WHERE ${where}
+      GROUP BY report_date, ${groupCol}
+      ORDER BY val DESC NULLS LAST LIMIT 30`;
+  }
+
+  // ── TOP 5 ─────────────────────────────────────────────────────
+  if (intent === 'top') {
+    return `SELECT report_date, group_name AS scope_label, ${listSelCols}
+      FROM daily_hr_report WHERE ${where}
+      GROUP BY report_date, group_name
+      ORDER BY val DESC NULLS LAST LIMIT 5`;
+  }
+
+  // ── GET_METRIC / SUMMARY : agréger ────────────────────────────
+  const groupByCol = filters.group    ? 'group_name'
+                   : filters.circuit  ? 'circuit'
+                   : filters.area     ? 'process'
+                   : 'plant';
+  return `SELECT report_date, ${groupByCol} AS scope_label, ${selCols}
+    FROM daily_hr_report WHERE ${where}
+    GROUP BY report_date, ${groupByCol}`;
+}
+
+// ── 9. FORMATAGE ─────────────────────────────────────────────────
+function fmt(v, dec=1) { return v==null ? 'N/D' : Number(v).toFixed(dec); }
 function fmtDate(d) {
   if (!d) return 'N/D';
   try { return new Date(d).toLocaleDateString('fr-TN',{day:'2-digit',month:'2-digit',year:'numeric'}); }
   catch(e) { return String(d); }
 }
 
-function formatList(rows, nlp) {
-  if (!rows || rows.length === 0) return `⚠️ Aucune donnée disponible.\nVérifiez que le rapport a été importé.`;
-  const { metric, intent, language: lang } = nlp;
-  const isPct = ['abs_np_rate','abs_p_rate','taux_presence'].includes(metric);
-  const unit = isPct ? '%' : '';
-  const metricLabel = {
-    np:'NP', p:'P', sq:'SQ', ac:'AC', rv:'RV (Renvoi)',
-    maladie:'ML (Maladie Prolongée)', mise_en_demeure:'MD (Mise en demeure - Fluctuation)',
-    abs_np_rate:'Taux NP %', abs_p_rate:'Taux P %', taux_presence:'Taux Présence %',
-    total_abs:'Total Abs', actif:'Effectif Actif', present:'Présents',
-    heures_sup:'H.Sup', heures_presence:'H.Présence', retard:'Retard',
-    delta:'Delta Soll/IST'
-  }[metric] || metric.toUpperCase();
+function formatAnswer(rows, filters, metricDef, intent, lang, debugInfo) {
+  const scopeLabel = buildScopeLabel(filters);
+  const metric = metricDef.metric;
 
-  const groupLabel = { list_group:'Groupe', list_area:'Area (HO)', list_circuit:'Circuit/Process' }[intent] || 'Scope';
-  const dateLabel = rows[0]?.report_date ? fmtDate(rows[0].report_date) : '';
+  // ── Aucune donnée ─────────────────────────────────────────────
+  if (!rows || rows.length === 0) {
+    const filterDesc = [
+      filters.group    ? `Groupe: ${filters.group}` : null,
+      filters.circuit  ? `Circuit: ${filters.circuit}` : null,
+      filters.activite ? `Activité: ${filters.activite}` : null,
+      filters.area     ? `Area: ${filters.area}` : null,
+    ].filter(Boolean).join(' | ') || 'BMW U11 complet';
 
-  let lines;
-  if (metric === 'delta') {
-    lines = rows.filter(r => r.scope_label).map((r,i) => {
-      const soll = fmt(parseFloat(r.soll)||0,0);
-      const ist  = fmt(parseFloat(r.ist)||0,0);
-      const d    = parseFloat(r.value)||0;
-      const sign = d >= 0 ? '+' : '';
-      return `  ${i+1}. *${r.scope_label}*\n     Soll=${soll}h | IST=${ist}h | Δ=${sign}${fmt(d)}h`;
-    }).join('\n');
-  } else {
-    lines = rows.filter(r => r.scope_label).map((r,i) => {
-      const v = parseFloat(r.value)||0;
-      const actif = r.actif ? ` / ${fmt(parseFloat(r.actif)||0,0)} actif` : '';
-      return `  ${i+1}. *${r.scope_label}* : ${fmt(v)}${unit}${actif}`;
-    }).join('\n');
+    return `⚠️ *Aucune donnée — ${metricDef.label}*\n\n` +
+      `🔍 Filtres appliqués : ${filterDesc}\n` +
+      `📅 Rapport : ${dateExprSQL('latest','') === dateExprSQL('latest','') ? 'dernier disponible' : ''}\n\n` +
+      `Causes possibles :\n` +
+      `• Rapport pas encore uploadé\n` +
+      (filters.activite ? `• Champ "activite" vide dans HTML (re-uploader après fix web_upload.js)\n` : '') +
+      `• Filtre trop restrictif\n\n` +
+      `💡 Tapez "résumé BMW U11" pour voir toutes les données disponibles` +
+      (debugInfo ? `\n\n🔧 DEBUG: ${debugInfo}` : '');
   }
 
-  if (lang === 'ar') {
-    return `📊 *${metricLabel} — لكل ${groupLabel}*\n📅 ${dateLabel}\n\n${lines}`;
+  // Agréger toutes les lignes retournées
+  const agg = {};
+  for (const r of rows) {
+    for (const [k,v] of Object.entries(r)) {
+      if (k === 'report_date' || k === 'scope_label') { agg[k] = agg[k] || v; continue; }
+      agg[k] = (agg[k]||0) + (parseFloat(v)||0);
+    }
   }
-  return `📊 *${metricLabel} — par ${groupLabel}*\n📅 ${dateLabel}\n\n${lines}`;
+  // Recalculer delta si nécessaire
+  if (agg.soll != null && agg.ist != null && !agg.val && metric === 'delta') {
+    agg.val = agg.ist - agg.soll;
+  }
+  const dl = fmtDate(agg.report_date);
+  const val = agg.val ?? 0;
+  const unit = metricDef.unit;
+  const d = (agg.delta||agg.val||0) >= 0 ? '+' : '';
+
+  // ── Résumé complet ────────────────────────────────────────────
+  if (metric === 'summary') {
+    const np_pct  = agg.actif ? fmt(agg.np/agg.actif*100)    : fmt(agg.abs_np_rate||0);
+    const p_pct   = agg.actif ? fmt(agg.p/agg.actif*100)     : fmt(agg.abs_p_rate||0);
+    const pres_pct= agg.actif ? fmt(agg.present/agg.actif*100): fmt(agg.taux_presence||0);
+    const deltaV  = agg.delta ?? (agg.ist - agg.soll);
+    const ds = deltaV >= 0 ? '+' : '';
+    if (lang === 'ar') {
+      return `📊 *ملخص ${scopeLabel}*\n📅 ${dl}\n\n` +
+        `👥 الأعداد: ${fmt(agg.actif,0)} | حاضرون: ${fmt(agg.present,0)} (${pres_pct}%)\n` +
+        `❌ NP: ${fmt(agg.np,0)} (${np_pct}%) | 🗓️ P: ${fmt(agg.p,0)} (${p_pct}%)\n` +
+        `📊 إجمالي غياب: ${fmt(agg.total_abs,0)}\n` +
+        `📋 SQ:${fmt(agg.sq,0)} | AC:${fmt(agg.ac,0)} | RV:${fmt(agg.rv,0)}\n` +
+        `🏥 ML:${fmt(agg.maladie,0)} | 🚪 MD:${fmt(agg.mise_en_demeure,0)}\n` +
+        `⚖️ Delta: ${ds}${fmt(deltaV)}h | ⏱️ H.Sup:${fmt(agg.heures_sup,0)}h`;
+    }
+    return `📊 *Résumé — ${scopeLabel}*\n📅 ${dl}\n\n` +
+      `👥 Actif: *${fmt(agg.actif,0)}* | Présents: *${fmt(agg.present,0)}* (${pres_pct}%)\n\n` +
+      `❌ NP: *${fmt(agg.np,0)}* (${np_pct}%) | 🗓️ P: *${fmt(agg.p,0)}* (${p_pct}%)\n` +
+      `📊 Total Abs: *${fmt(agg.total_abs,0)}*\n\n` +
+      `📋 SQ: ${fmt(agg.sq,0)} | AC: ${fmt(agg.ac,0)} | RV: ${fmt(agg.rv,0)}\n` +
+      `🏥 ML: ${fmt(agg.maladie,0)} | 🚪 MD: ${fmt(agg.mise_en_demeure,0)}\n\n` +
+      `🎯 Soll: ${fmt(agg.soll,1)}h | ✅ IST: ${fmt(agg.ist,1)}h | ⚖️ Delta: ${ds}${fmt(deltaV,1)}h\n` +
+      `⏱️ H.Sup: ${fmt(agg.heures_sup,0)}h | 🕐 H.Pres: ${fmt(agg.heures_presence,0)}h\n` +
+      `⏰ Retards: ${fmt(agg.retard,0)}`;
+  }
+
+  // ── Process / Activité : carte dédiée ─────────────────────────
+  if (filters.activite) {
+    if (metric === 'delta' || metric === 'soll' || metric === 'ist') {
+      const hasSollIst = agg.soll > 0 || agg.ist > 0;
+      if (!hasSollIst) {
+        return `⚠️ *${metricDef.label} — ${scopeLabel}*\n📅 ${dl}\n\n` +
+          `Soll=${fmt(agg.soll,1)}h / IST=${fmt(agg.ist,1)}h (données = 0)\n\n` +
+          `💡 Les colonnes Soll/IST sont vides. Actions :\n` +
+          `1. Vérifier la console upload (champs disponibles dans HTML)\n` +
+          `2. Re-uploader le rapport — web_upload.js cherche : soll, ist, soll_h, ist_h, planifie, reel\n` +
+          `3. Si champs différents, me communiquer les vrais noms`;
+      }
+      const deltaCalc = (agg.ist||0) - (agg.soll||0);
+      const ds = deltaCalc >= 0 ? '+' : '';
+      return `📊 *Process ${scopeLabel}*\n📅 ${dl}\n\n` +
+        `🎯 Soll  = *${fmt(agg.soll,1)}h*\n` +
+        `✅ IST   = *${fmt(agg.ist,1)}h*\n` +
+        `⚖️ Delta = *${ds}${fmt(deltaCalc,1)}h*\n` +
+        `👥 Actif = ${fmt(agg.actif,0)}`;
+    }
+    if (metric === 'actif') {
+      return `👥 *${metricDef.label} — ${scopeLabel}*\n📅 ${dl}\n\n` +
+        `👥 Nombre (Actif) = *${fmt(val,0)}*\n` +
+        `✅ Présents       = ${fmt(agg.present,0)}\n` +
+        (agg.actif ? `📈 Taux présence  = ${fmt(agg.present/agg.actif*100)}%` : '');
+    }
+  }
+
+  // ── Delta / Soll / IST standard ───────────────────────────────
+  if (metric === 'delta' || metric === 'soll' || metric === 'ist') {
+    const deltaCalc = (agg.ist||0) - (agg.soll||0);
+    const ds = deltaCalc >= 0 ? '+' : '';
+    return `⚖️ *${metricDef.label} — ${scopeLabel}*\n📅 ${dl}\n\n` +
+      `🎯 Soll  = *${fmt(agg.soll,1)}h*\n` +
+      `✅ IST   = *${fmt(agg.ist,1)}h*\n` +
+      `⚖️ Delta = *${ds}${fmt(deltaCalc,1)}h*\n` +
+      `👥 Actif = ${fmt(agg.actif,0)}`;
+  }
+
+  // ── Taux ──────────────────────────────────────────────────────
+  if (metric === 'abs_np_rate' || metric === 'abs_p_rate' || metric === 'taux_presence') {
+    const rate = agg.val ?? (agg.num_val && agg.den_val ? agg.num_val/agg.den_val*100 : 0);
+    return `📊 *${metricDef.label} — ${scopeLabel}*\n📅 ${dl}\n\n` +
+      `📉 ${metricDef.label} = *${fmt(rate)}%*\n` +
+      (agg.np   != null ? `   NP: ${fmt(agg.np,0)}` : '') +
+      (agg.p    != null ? ` | P: ${fmt(agg.p,0)}`   : '') +
+      (agg.actif         ? `\n👥 Actif: ${fmt(agg.actif,0)}`  : '');
+  }
+
+  // ── NP / P avec taux ──────────────────────────────────────────
+  if (metric === 'np' || metric === 'p') {
+    const emoji = metric === 'np' ? '❌' : '🗓️';
+    const pct = agg.actif ? fmt(val/agg.actif*100) : fmt(agg.pct||0);
+    return `${emoji} *${metricDef.label} — ${scopeLabel}*\n📅 ${dl}\n\n` +
+      `${emoji} ${metricDef.label} = *${fmt(val,0)}*\n` +
+      `📉 Taux = ${pct}%\n` +
+      `👥 Actif = ${fmt(agg.actif,0)}`;
+  }
+
+  // ── Présents ──────────────────────────────────────────────────
+  if (metric === 'present') {
+    const pct = agg.actif ? fmt(val/agg.actif*100) : fmt(agg.pct||0);
+    return `✅ *Présents — ${scopeLabel}*\n📅 ${dl}\n\n` +
+      `✅ Présents = *${fmt(val,0)}*\n` +
+      `📈 Taux = ${pct}%\n` +
+      `👥 Actif = ${fmt(agg.actif,0)}`;
+  }
+
+  // ── Actif ─────────────────────────────────────────────────────
+  if (metric === 'actif') {
+    return `👥 *Effectif Actif — ${scopeLabel}*\n📅 ${dl}\n\n` +
+      `👥 Actif = *${fmt(val,0)}*\n` +
+      `✅ Présents = ${fmt(agg.present,0)}`;
+  }
+
+  // ── Total Abs ─────────────────────────────────────────────────
+  if (metric === 'total_abs') {
+    const np_pct = agg.actif ? fmt(agg.np/agg.actif*100) : '0.0';
+    const p_pct  = agg.actif ? fmt(agg.p/agg.actif*100)  : '0.0';
+    return `📊 *Total Absences — ${scopeLabel}*\n📅 ${dl}\n\n` +
+      `👥 Actif : ${fmt(agg.actif,0)}\n` +
+      `❌ NP : *${fmt(agg.np,0)}* (${np_pct}%) | 🗓️ P : *${fmt(agg.p,0)}* (${p_pct}%)\n` +
+      `📊 Total Abs = *${fmt(val,0)}*`;
+  }
+
+  // ── Heures présence ───────────────────────────────────────────
+  if (metric === 'heures_presence') {
+    return `🕐 *Heures Présence — ${scopeLabel}*\n📅 ${dl}\n\n` +
+      `🕐 H.Présence = *${fmt(val,1)}h*\n` +
+      (agg.actif ? `👥 Actif = ${fmt(agg.actif,0)}` : '');
+  }
+
+  // ── Générique (ML, MD, SQ, AC, RV, Retard, H.Sup) ────────────
+  const emojis = { maladie:'🏥',mise_en_demeure:'⚠️',sq:'📋',ac:'🔁',rv:'📌',
+                   retard:'⏰',heures_sup:'⏱️' };
+  const emoji2 = emojis[metric] || '📊';
+  return `${emoji2} *${metricDef.label} — ${scopeLabel}*\n📅 ${dl}\n\n` +
+    `${emoji2} ${metricDef.label} = *${fmt(val,0)}${unit}*`;
 }
 
-function aggRows(rows) {
-  if (!rows || rows.length === 0) return null;
-  const a = rows.reduce((acc, r) => {
-    ['actif','present','p','np','sq','ac','rv','ml','md','maladie','mise_en_demeure','total_abs','retard','heures_sup','heures_presence'].forEach(k => { acc[k]=(acc[k]||0)+(parseFloat(r[k])||0); });
-    acc.report_date = r.report_date; return acc;
-  }, {});
-  a.abs_np_rate   = a.actif ? Math.round(a.np/a.actif*10000)/100 : 0;
-  a.abs_p_rate    = a.actif ? Math.round(a.p/a.actif*10000)/100 : 0;
-  a.taux_presence = a.actif ? Math.round(a.present/a.actif*10000)/100 : 0;
-  a.maladie = a.ml; a.mise_en_demeure = a.md;
-  return a;
+function formatList(rows, metricDef, intent, lang) {
+  if (!rows || rows.length === 0)
+    return `⚠️ Aucune donnée disponible.\nVérifiez que le rapport a été importé.`;
+  const groupLabel = {list_group:'Groupe',list_area:'Area (HO)',list_circuit:'Circuit/Process'}[intent]||'Scope';
+  const dl = rows[0]?.report_date ? fmtDate(rows[0].report_date) : '';
+  const metric = metricDef.metric;
+
+  const lines = rows.filter(r=>r.scope_label).map((r,i)=>{
+    const label = r.scope_label;
+    if (metric === 'delta' || metric === 'soll' || metric === 'ist') {
+      const ds = (parseFloat(r.delta)||0) >= 0 ? '+' : '';
+      return `  ${i+1}. *${label}*\n     Soll=${fmt(r.soll,1)}h | IST=${fmt(r.ist,1)}h | Δ=${ds}${fmt(r.delta,1)}h`;
+    }
+    if (metric === 'summary') {
+      const pct = r.actif ? fmt(r.np/r.actif*100) : '0.0';
+      return `  ${i+1}. *${label}* — NP:${fmt(r.np,0)} P:${fmt(r.p,0)} | Taux NP:${pct}% | Actif:${fmt(r.actif,0)}`;
+    }
+    const v = parseFloat(r.val)||0;
+    const unit = metricDef.unit;
+    const actif = r.actif ? ` / ${fmt(parseFloat(r.actif),0)} actif` : '';
+    const pct   = (r.pct)  ? ` (${fmt(r.pct)}%)` : '';
+    return `  ${i+1}. *${label}* : ${fmt(v)}${unit}${pct}${actif}`;
+  }).join('\n');
+
+  return `📊 *${metricDef.label} — par ${groupLabel}*\n📅 ${dl}\n\n${lines}`;
 }
 
-function formatComparison(rows1, rows2, dates, metric, scope, lang) {
-  const a1 = aggRows(rows1);
-  const a2 = aggRows(rows2);
-  const d1 = fmtDate(dates.date1);
-  const d2 = fmtDate(dates.date2);
+function formatComparison(rows1, rows2, dates, metricDef, scopeLabel, lang) {
+  const d1 = fmtDate(dates.date1), d2 = fmtDate(dates.date2);
+  const metric = metricDef.metric;
 
-  const getVal = (a, m) => {
+  // Agréger
+  const agg = (rows) => {
+    if (!rows || rows.length === 0) return null;
+    const a = {};
+    for (const r of rows) {
+      for (const [k,v] of Object.entries(r)) {
+        if (k==='report_date'||k==='scope_label') { a[k]=a[k]||v; continue; }
+        a[k]=(a[k]||0)+(parseFloat(v)||0);
+      }
+    }
+    if (a.soll!=null && a.ist!=null) a.delta = a.ist - a.soll;
+    return a;
+  };
+  const a1 = agg(rows1), a2 = agg(rows2);
+
+  const getVal = a => {
     if (!a) return null;
-    const map = { np:'np', p:'p', sq:'sq', ac:'ac', rv:'rv', maladie:'maladie', mise_en_demeure:'mise_en_demeure',
-      abs_np_rate:'abs_np_rate', abs_p_rate:'abs_p_rate', taux_presence:'taux_presence',
-      total_abs:'total_abs', actif:'actif', present:'present', heures_sup:'heures_sup',
-      retard:'retard', heures_presence:'heures_presence' };
-    return a[map[m] || 'total_abs'];
+    if (metric==='delta') return a.delta ?? (a.ist-a.soll);
+    if (metric==='abs_np_rate') return a.actif ? a.np/a.actif*100 : 0;
+    if (metric==='abs_p_rate')  return a.actif ? a.p/a.actif*100  : 0;
+    if (metric==='taux_presence') return a.actif ? a.present/a.actif*100 : 0;
+    return a.val ?? a[metricDef.col] ?? 0;
   };
 
-  const v1 = getVal(a1, metric);
-  const v2 = getVal(a2, metric);
+  const v1 = getVal(a1), v2 = getVal(a2);
   const isPct = ['abs_np_rate','abs_p_rate','taux_presence'].includes(metric);
-  const unit = isPct ? '%' : '';
-  const diff = (v2 != null && v1 != null) ? v2 - v1 : null;
-  const arrow = diff == null ? '➡️' : diff > 0 ? '📈' : diff < 0 ? '📉' : '➡️';
-  const sign = diff >= 0 ? '+' : '';
+  const unit = metricDef.unit;
+  const diff = (v1!=null && v2!=null) ? v2-v1 : null;
+  const arrow = diff==null?'➡️':diff>0?'📈':diff<0?'📉':'➡️';
+  const sign  = diff>=0?'+':'';
 
-  const metricLabel = {
-    np:'NP', p:'P', sq:'SQ', ac:'AC', rv:'RV', maladie:'ML (Maladie Prol.)',
-    mise_en_demeure:'MD (Mise en demeure)', abs_np_rate:'Taux NP', abs_p_rate:'Taux P',
-    taux_presence:'Taux Présence', total_abs:'Total Abs', actif:'Effectif Actif',
-    present:'Présents', heures_sup:'H.Sup', retard:'Retard', heures_presence:'H.Présence'
-  }[metric] || metric.toUpperCase();
-
-  // Compute percentage rates for count metrics (total_abs, np, p, etc.)
-  const getPct = (a, m) => {
-    if (!a || !a.actif) return null;
-    if (m === 'total_abs') return Math.round(((a.total_abs||0) / a.actif) * 10000) / 100;
-    if (m === 'np')       return Math.round(((a.np||0)        / a.actif) * 10000) / 100;
-    if (m === 'p')        return Math.round(((a.p||0)         / a.actif) * 10000) / 100;
-    if (m === 'present')  return Math.round(((a.present||0)   / a.actif) * 10000) / 100;
+  // Percentage of total for count metrics
+  const getPct = (a, v) => {
+    if (!a?.actif) return null;
+    if (['np','p','total_abs','present'].includes(metric)) return v/a.actif*100;
     return null;
   };
-  const pct1 = !isPct ? getPct(a1, metric) : null;
-  const pct2 = !isPct ? getPct(a2, metric) : null;
-  const pctDiff = (pct1 != null && pct2 != null) ? Math.round((pct2 - pct1) * 100) / 100 : null;
+  const pct1 = !isPct ? getPct(a1,v1) : null;
+  const pct2 = !isPct ? getPct(a2,v2) : null;
+  const pctDiff = (pct1!=null&&pct2!=null) ? pct2-pct1 : null;
 
-  const actif1 = a1?.actif || 0;
-  const actif2 = a2?.actif || 0;
+  const v1Str = v1!=null ? `${fmt(v1)}${unit}` : 'N/D';
+  const v2Str = v2!=null ? `${fmt(v2)}${unit}` : 'N/D';
+  const p1Str = pct1!=null ? ` (${fmt(pct1)}%)` : '';
+  const p2Str = pct2!=null ? ` (${fmt(pct2)}%)` : '';
+  const evolStr = diff!=null ? `${sign}${fmt(diff)}${unit}` : 'N/D';
+  const evolPStr= pctDiff!=null ? ` (${pctDiff>=0?'+':''}${fmt(pctDiff)}%)` : '';
+  const actif1 = a1?.actif||0, actif2 = a2?.actif||0;
+  const actifStr = (actif1>0||actif2>0) ? `\n👥 Actif : ${fmt(actif1,0)} → ${fmt(actif2,0)}` : '';
 
-  const v1Str = v1 != null ? fmt(v1) + unit : 'N/D';
-  const v2Str = v2 != null ? fmt(v2) + unit : 'N/D';
-  const pct1Str = pct1 != null ? ` (${fmt(pct1)}%)` : '';
-  const pct2Str = pct2 != null ? ` (${fmt(pct2)}%)` : '';
-  const evolStr = diff != null ? sign + fmt(diff) + unit : 'N/D';
-  const evolPctStr = pctDiff != null ? ` (${pctDiff >= 0 ? '+' : ''}${fmt(pctDiff)}%)` : '';
-  const actifStr = (actif1 > 0 || actif2 > 0)
-    ? `\n👥 Actif : ${fmt(actif1,0)} → ${fmt(actif2,0)}`
-    : '';
-
-  if (lang === 'ar') {
-    return `📊 *مقارنة ${metricLabel} — ${scope}*\n\n` +
-      `📅 ${d1} : *${v1Str}*${pct1Str}\n` +
-      `📅 ${d2} : *${v2Str}*${pct2Str}\n\n` +
-      `${arrow} ${evolStr}${evolPctStr}${actifStr}`;
+  // Delta special: show soll+ist
+  let extra = '';
+  if (metric === 'delta' || metric === 'soll' || metric === 'ist') {
+    extra = `\n\n📋 Détail:\n` +
+      `  Soll : ${fmt(a1?.soll,1)}h → ${fmt(a2?.soll,1)}h\n` +
+      `  IST  : ${fmt(a1?.ist,1)}h → ${fmt(a2?.ist,1)}h`;
   }
-  return `📊 *Comparaison ${metricLabel} — ${scope}*\n\n` +
-    `📅 ${d1} : *${v1Str}*${pct1Str}\n` +
-    `📅 ${d2} : *${v2Str}*${pct2Str}\n\n` +
-    `${arrow} Évolution : ${evolStr}${evolPctStr}${actifStr}`;
+
+  return `📊 *Comparaison ${metricDef.label} — ${scopeLabel}*\n\n` +
+    `📅 ${d1} : *${v1Str}*${p1Str}\n` +
+    `📅 ${d2} : *${v2Str}*${p2Str}\n\n` +
+    `${arrow} Évolution : ${evolStr}${evolPStr}${actifStr}${extra}`;
 }
 
-function formatResponse(rows, nlp) {
-  const { metric, intent, language: lang, scope_value: scope } = nlp;
-  if (!rows || rows.length === 0) {
-    const m = { fr:`⚠️ Aucune donnée pour *${scope}*.\n\nVérifiez que le rapport a été importé.`, ar:`⚠️ لا توجد بيانات لـ *${scope}*.`, tn:`⚠️ Makatech data pour *${scope}*.` };
-    return m[lang] || m.fr;
-  }
-  const agg = rows.reduce((a,r) => {
-    ['actif','present','nb_abs','p','np','sq','ac','rv','ml','md','maladie','mise_en_demeure','total_abs','retard','heures_sup','soll','ist'].forEach(k => { a[k]=(a[k]||0)+(parseFloat(r[k])||0); });
-    a.report_date=r.report_date; return a;
-  },{});
-  agg.abs_np_rate   = agg.actif ? Math.round(agg.np/agg.actif*10000)/100 : (parseFloat(rows[0]?.abs_np_rate)||0);
-  agg.abs_p_rate    = agg.actif ? Math.round(agg.p/agg.actif*10000)/100  : (parseFloat(rows[0]?.abs_p_rate)||0);
-  agg.taux_presence = agg.actif ? Math.round(agg.present/agg.actif*10000)/100 : (parseFloat(rows[0]?.taux_presence)||0);
-  agg.delta         = rows[0]?.delta!=null ? parseFloat(rows[0].delta)||0 : Math.round((agg.ist-agg.soll)*100)/100;
-  agg.maladie=agg.ml; agg.mise_en_demeure=agg.md;
-  const dl=fmtDate(agg.report_date), d=agg.delta>=0?'+':'';
-
-  if (intent==='get_summary') {
-    const t={
-      fr:`📊 *Résumé ${scope}*\n📅 ${dl}\n\n` +
-         `👥 Actif : ${fmt(agg.actif,0)} | Présents : ${fmt(agg.present,0)}\n` +
-         `✅ Taux Présence : ${fmt(agg.taux_presence)}%\n\n` +
-         `❌ NP : ${fmt(agg.np,0)} (${fmt(agg.abs_np_rate)}%)\n` +
-         `🗓️ P  : ${fmt(agg.p,0)} (${fmt(agg.abs_p_rate)}%)\n` +
-         `📊 Total Abs : ${fmt(agg.total_abs,0)}\n\n` +
-         `📋 SQ : ${fmt(agg.sq,0)} | AC : ${fmt(agg.ac,0)} | RV : ${fmt(agg.rv,0)}\n\n` +
-         `🏥 ML (Maladie Prolongée) : ${fmt(agg.maladie,0)}\n` +
-         `🚪 MD (Mise en demeure / Fluctuation) : ${fmt(agg.mise_en_demeure,0)}\n` +
-         `⚠️ _ML et MD sont deux indicateurs séparés_\n\n` +
-         `⏱️ H.Sup : ${fmt(agg.heures_sup,0)} | ⏰ Retard : ${fmt(agg.retard,0)}`,
-      ar:`📊 *ملخص ${scope}*\n📅 ${dl}\n\n` +
-         `👥 العدد: ${fmt(agg.actif,0)} | الحضور: ${fmt(agg.present,0)} (${fmt(agg.taux_presence)}%)\n` +
-         `❌ NP: ${fmt(agg.np,0)} (${fmt(agg.abs_np_rate)}%) | 🗓️ P: ${fmt(agg.p,0)} (${fmt(agg.abs_p_rate)}%)\n` +
-         `📊 إجمالي: ${fmt(agg.total_abs,0)}\n` +
-         `🏥 ML (مرض طويل الأمد): ${fmt(agg.maladie,0)}\n` +
-         `🚪 MD (إنهاء عقد): ${fmt(agg.mise_en_demeure,0)}\n` +
-         `⏱️ إضافي: ${fmt(agg.heures_sup,0)} | تأخير: ${fmt(agg.retard,0)}`,
-      tn:`📊 *Résumé ${scope}*\n📅 ${dl}\n\n` +
-         `👥 ${fmt(agg.actif,0)} | Présents: ${fmt(agg.present,0)} (${fmt(agg.taux_presence)}%)\n` +
-         `NP: ${fmt(agg.np,0)} (${fmt(agg.abs_np_rate)}%) | P: ${fmt(agg.p,0)} (${fmt(agg.abs_p_rate)}%)\n` +
-         `Total: ${fmt(agg.total_abs,0)}\n` +
-         `ML (Maladie Prol.): ${fmt(agg.maladie,0)} | MD (Fluctuation): ${fmt(agg.mise_en_demeure,0)}\n` +
-         `H.Sup: ${fmt(agg.heures_sup,0)} | Retard: ${fmt(agg.retard,0)}`
-    };
-    return t[lang]||t.fr;
-  }
-  if (intent==='top') {
-    const lines=rows.slice(0,5).map((r,i)=>`  ${i+1}. ${r.scope_label}: ${fmt(r.value||0,0)}`).join('\n');
-    return `🏆 *Top 5 — ${metric.toUpperCase()} — ${scope}*\n📅 ${dl}\n\n${lines}`;
-  }
-  const tpl={
-    np:{fr:`📊 *Absence NP — ${scope}*\n📅 ${dl}\n\n❌ NP = ${fmt(agg.np,0)}\n👥 Actif = ${fmt(agg.actif,0)}\n📉 Taux NP = ${fmt(agg.abs_np_rate)}%`,ar:`📊 *غياب NP — ${scope}*\n📅 ${dl}\n\n❌ NP = ${fmt(agg.np,0)} | ${fmt(agg.abs_np_rate)}%`,tn:`📊 *NP — ${scope}*\n📅 ${dl}\n\n❌ NP = ${fmt(agg.np,0)} (${fmt(agg.abs_np_rate)}%)`},
-    p:{fr:`📊 *Absence P — ${scope}*\n📅 ${dl}\n\n🗓️ P = ${fmt(agg.p,0)}\n👥 Actif = ${fmt(agg.actif,0)}\n📉 Taux P = ${fmt(agg.abs_p_rate)}%`,ar:`📊 *غياب P*\n📅 ${dl}\n\n🗓️ P = ${fmt(agg.p,0)} | ${fmt(agg.abs_p_rate)}%`,tn:`📊 *P — ${scope}*\n📅 ${dl}\n\n🗓️ P = ${fmt(agg.p,0)} (${fmt(agg.abs_p_rate)}%)`},
-    sq:{fr:`📋 *SQ — ${scope}*\n📅 ${dl}\n\n📋 SQ = ${fmt(agg.sq,0)}`,ar:`📋 *SQ*\n📅 ${dl}\n\nSQ = ${fmt(agg.sq,0)}`,tn:`📋 *SQ*\n📅 ${dl}\n\nSQ = ${fmt(agg.sq,0)}`},
-    ac:{fr:`📋 *AC — ${scope}*\n📅 ${dl}\n\n🔁 AC = ${fmt(agg.ac,0)}`,ar:`📋 *AC*\n📅 ${dl}\n\nAC = ${fmt(agg.ac,0)}`,tn:`📋 *AC*\n📅 ${dl}\n\nAC = ${fmt(agg.ac,0)}`},
-    rv:{fr:`📋 *RV — Renvoi — ${scope}*\n📅 ${dl}\n\n📌 RV (Renvoi) = ${fmt(agg.rv,0)}`,ar:`📋 *RV — رفض*\n📅 ${dl}\n\nRV = ${fmt(agg.rv,0)}`,tn:`📋 *RV (Renvoi)*\n📅 ${dl}\n\nRV = ${fmt(agg.rv,0)}`},
-    maladie:{
-      fr:`🏥 *ML — Maladie Prolongée — ${scope}*\n📅 ${dl}\n\n🤒 ML (Maladie Prolongée) = ${fmt(agg.maladie,0)}`,
-      ar:`🏥 *ML — مرض طويل الأمد — ${scope}*\n📅 ${dl}\n\n🤒 ML (Maladie Prolongée) = ${fmt(agg.maladie,0)}`,
-      tn:`🏥 *ML — Maladie Prolongée — ${scope}*\n📅 ${dl}\n\nML = ${fmt(agg.maladie,0)}`},
-    mise_en_demeure:{
-      fr:`⚠️ *MD — Mise en demeure (Fluctuation) — ${scope}*\n📅 ${dl}\n\n🚪 MD (Mise en demeure / Fluctuation) = ${fmt(agg.mise_en_demeure,0)}`,
-      ar:`⚠️ *MD — إنذار (Fluctuation) — ${scope}*\n📅 ${dl}\n\n🚪 MD = ${fmt(agg.mise_en_demeure,0)}`,
-      tn:`⚠️ *MD — Mise en demeure (Fluctuation) — ${scope}*\n📅 ${dl}\n\nMD = ${fmt(agg.mise_en_demeure,0)}`},
-    abs_np_rate:{fr:`📊 *Taux NP — ${scope}*\n📅 ${dl}\n\n📉 Taux NP = ${fmt(agg.abs_np_rate)}%\n   NP = ${fmt(agg.np,0)} / Actif = ${fmt(agg.actif,0)}`,ar:`📊 *نسبة NP*\n📅 ${dl}\n\n📉 ${fmt(agg.abs_np_rate)}%`,tn:`📊 *Taux NP*\n📅 ${dl}\n\n📉 ${fmt(agg.abs_np_rate)}% (NP=${fmt(agg.np,0)})`},
-    abs_p_rate:{fr:`📊 *Taux P — ${scope}*\n📅 ${dl}\n\n📉 Taux P = ${fmt(agg.abs_p_rate)}%\n   P = ${fmt(agg.p,0)} / Actif = ${fmt(agg.actif,0)}`,ar:`📊 *نسبة P*\n📅 ${dl}\n\n📉 ${fmt(agg.abs_p_rate)}%`,tn:`📊 *Taux P*\n📅 ${dl}\n\n📉 ${fmt(agg.abs_p_rate)}%`},
-    total_abs:{fr:`📊 *Total Absences — ${scope}*\n📅 ${dl}\n\n👥 Actif : ${fmt(agg.actif,0)}\n❌ NP : ${fmt(agg.np,0)} | 🗓️ P : ${fmt(agg.p,0)}\n📊 Total Abs = ${fmt(agg.total_abs,0)}`,ar:`📊 *إجمالي الغيابات*\n📅 ${dl}\n\nNP=${fmt(agg.np,0)} | P=${fmt(agg.p,0)} | Total=${fmt(agg.total_abs,0)}`,tn:`📊 *Total Abs*\n📅 ${dl}\n\nNP=${fmt(agg.np,0)} | P=${fmt(agg.p,0)} | Total=${fmt(agg.total_abs,0)}`},
-    taux_presence:{fr:`✅ *Taux Présence — ${scope}*\n📅 ${dl}\n\n✅ Taux = ${fmt(agg.taux_presence)}%\n   Présents = ${fmt(agg.present,0)} / Actif = ${fmt(agg.actif,0)}`,ar:`✅ *نسبة الحضور*\n📅 ${dl}\n\n✅ ${fmt(agg.taux_presence)}%`,tn:`✅ *Présence*\n📅 ${dl}\n\n✅ ${fmt(agg.taux_presence)}%`},
-    delta:{fr:`⚖️ *Delta Soll/IST — ${scope}*\n📅 ${dl}\n\n🎯 Soll = ${fmt(agg.soll,0)}h\n✅ IST = ${fmt(agg.ist,0)}h\n📊 Delta = ${d}${fmt(agg.delta)}h`,ar:`⚖️ *Delta*\n📅 ${dl}\n\nDelta = ${d}${fmt(agg.delta)}h`,tn:`⚖️ *Delta*\n📅 ${dl}\n\n${d}${fmt(agg.delta)}h`},
-    heures_sup:{fr:`⏱️ *Heures Sup — ${scope}*\n📅 ${dl}\n\n⏱️ H.Sup = ${fmt(agg.heures_sup,0)}h`,ar:`⏱️ *ساعات إضافية*\n📅 ${dl}\n\n${fmt(agg.heures_sup,0)}h`,tn:`⏱️ *H.Sup*\n📅 ${dl}\n\n${fmt(agg.heures_sup,0)}h`},
-    heures_presence:{fr:`🕐 *Heures Présence — ${scope}*\n📅 ${dl}\n\n🕐 H.Présence = ${fmt(parseFloat(rows[0]?.heures_presence)||agg.heures_presence,1)}h\n👥 Actif = ${fmt(agg.actif,0)}`,ar:`🕐 *ساعات الحضور — ${scope}*\n📅 ${dl}\n\n🕐 ${fmt(parseFloat(rows[0]?.heures_presence)||agg.heures_presence,1)}h`,tn:`🕐 *H.Présence*\n📅 ${dl}\n\n🕐 ${fmt(parseFloat(rows[0]?.heures_presence)||agg.heures_presence,1)}h`},
-    retard:{fr:`⏰ *Retards — ${scope}*\n📅 ${dl}\n\n⏰ Retards = ${fmt(agg.retard,0)} cas`,ar:`⏰ *تأخيرات*\n📅 ${dl}\n\n${fmt(agg.retard,0)}`,tn:`⏰ *Retards*\n📅 ${dl}\n\n${fmt(agg.retard,0)} cas`},
-    actif:{fr:`👥 *Effectif Actif — ${scope}*\n📅 ${dl}\n\n👥 Actif = ${fmt(agg.actif,0)}`,ar:`👥 *العدد*\n📅 ${dl}\n\n👥 ${fmt(agg.actif,0)}`,tn:`👥 *Actif*\n📅 ${dl}\n\n👥 ${fmt(agg.actif,0)}`},
-    present:{fr:`✅ *Présents — ${scope}*\n📅 ${dl}\n\n✅ Présents = ${fmt(agg.present,0)} / ${fmt(agg.actif,0)}\n📈 Taux = ${fmt(agg.taux_presence)}%`,ar:`✅ *الحاضرون*\n📅 ${dl}\n\n✅ ${fmt(agg.present,0)}`,tn:`✅ *Présents*\n📅 ${dl}\n\n✅ ${fmt(agg.present,0)} / ${fmt(agg.actif,0)}`},
-  };
-  const t=tpl[metric]||tpl.total_abs;
-  return t[lang]||t.fr;
+// ── 10. RÉPONSES STATIQUES ────────────────────────────────────────
+function getBestEmployeeMsg() {
+  return `🏆 *Critères Best Employee — BMW U11*\n\n` +
+    `*🥇 Meilleur Employé du Mois :*\n` +
+    `✅ NON éliminatoires :\n` +
+    `  • Polyvalence\n  • ≥ 2 idées amélioration continue\n` +
+    `  • Objectifs Efficience atteints\n  • Objectifs Qualité atteints\n\n` +
+    `❌ Éliminatoires :\n` +
+    `  • Absence non justifiée\n  • ≥ 1 absence justifiée\n` +
+    `  • Retard\n  • Sanction disciplinaire\n  • Ancienneté < 3 mois\n  • Oubli de pointage\n\n` +
+    `*🥇 Meilleur Employé de l'Année :*\n` +
+    `✅ NON éliminatoires :\n` +
+    `  • Polyvalence\n  • ≥ 3 idées amélioration continue\n` +
+    `  • Objectifs Efficience atteints\n  • Objectifs Qualité atteints\n\n` +
+    `❌ Éliminatoires :\n` +
+    `  • Absence non justifiée\n  • ≥ 4 absences justifiées\n` +
+    `  • ≥ 3 retards\n  • Sanction disciplinaire\n  • Ancienneté < 1 an\n  • ≥ 2 oublis de pointage`;
 }
 
-// ── Traitement message ───────────────────────────────────────────
+function getBestTeamMsg() {
+  return `🏆 *Critères Best Team — BMW U11*\n\n` +
+    `✅ Performance collective :\n` +
+    `  • Taux de présence élevé\n  • Zéro absence NP dans l'équipe\n` +
+    `  • Objectifs Qualité & Efficience atteints\n  • Participation aux idées d'amélioration\n\n` +
+    `❌ Éliminatoires équipe :\n` +
+    `  • Absence non justifiée dans l'équipe\n  • Sanction disciplinaire membre\n` +
+    `  • Objectifs non atteints\n\n` +
+    `Pour consulter les données d'un groupe : _Ex: résumé G-852_`;
+}
+
+// ── 11. TRAITEMENT MESSAGE ────────────────────────────────────────
 async function processMessage(sock, jid, text) {
-  const t = text.toLowerCase().trim();
-  const phone = '+' + jid.replace('@s.whatsapp.net','').replace('@c.us','').replace(/\D/g,'');
+  const raw  = text.trim();
+  const n    = normalizeText(raw);
+  const lang = detectLang(raw);
+  const phone= '+' + jid.replace('@s.whatsapp.net','').replace('@c.us','').replace(/\D/g,'');
 
-  console.log(`\n💬 [${phone}] "${text}"`);
+  // DEBUG log
+  console.log(`\n💬 [${phone}] "${raw}"`);
+  console.log(`   🔤 Normalisé: "${n}"`);
 
-  // Tous les numéros sont autorisés — accès libre
-  console.log(`   ✅ Accès libre: ${phone}`);
-
-  // NLP
-  const lang   = detectLang(t);
-  const date   = detectDate(t);
-  let   metric = detectMetric(t);
-  let   scope  = detectScope(t);
-  const intent = detectIntent(t, metric);
-
-  console.log(`   📊 NLP: ${intent} | ${metric} | ${scope.type}:${scope.value} | ${date.mode} | ${lang}`);
-
-  // ── Best Employee / Best Team ──────────────────────────────────
-  if (intent === 'best_employee') {
-    const msg = `🏆 *Critères Best Employee — BMW U11*\n\n` +
-      `*🥇 Meilleur Employé du Mois (Unité) :*\n` +
-      `✅ Conditions NON éliminatoires :\n` +
-      `  • Polyvalence\n` +
-      `  • ≥ 2 idées dans le système d'amélioration continue\n` +
-      `  • Objectifs Efficience atteints\n` +
-      `  • Objectifs Qualité atteints\n\n` +
-      `❌ Conditions éliminatoires :\n` +
-      `  • Absence non justifiée\n` +
-      `  • ≥ 1 absence justifiée\n` +
-      `  • Retard\n` +
-      `  • Sanction disciplinaire\n` +
-      `  • Ancienneté < 3 mois\n` +
-      `  • Oubli de pointage\n\n` +
-      `*🥇 Meilleur Employé de l'Année — Leoni Tunisie :*\n` +
-      `✅ Conditions NON éliminatoires :\n` +
-      `  • Polyvalence\n` +
-      `  • ≥ 3 idées amélioration continue\n` +
-      `  • Objectifs Efficience atteints\n` +
-      `  • Objectifs Qualité atteints\n\n` +
-      `❌ Conditions éliminatoires :\n` +
-      `  • Absence non justifiée\n` +
-      `  • ≥ 4 absences justifiées\n` +
-      `  • ≥ 3 retards\n` +
-      `  • Sanction disciplinaire\n` +
-      `  • Ancienneté < 1 an\n` +
-      `  • ≥ 2 oublis de pointage`;
-    await sock.sendMessage(jid, { text: msg });
-    return;
+  // ── Réponses statiques ────────────────────────────────────────
+  if (/best\s*employ|أفضل\s*عامل|critere.*best\s*employ|meilleur.*employ/.test(n)) {
+    await sock.sendMessage(jid, { text: getBestEmployeeMsg() }); return;
+  }
+  if (/best\s*team|أفضل\s*فريق|critere.*best.*team|meilleur.*equipe/.test(n)) {
+    await sock.sendMessage(jid, { text: getBestTeamMsg() }); return;
   }
 
-  if (intent === 'best_team') {
-    const msg = `🏆 *Critères Best Team — BMW U11*\n\n` +
-      `Les mêmes critères que Best Employee s'appliquent à l'équipe :\n\n` +
-      `✅ Performance collective :\n` +
-      `  • Taux de présence élevé\n` +
-      `  • Zéro absence NP dans l'équipe\n` +
-      `  • Objectifs Qualité & Efficience atteints\n` +
-      `  • Participation aux idées d'amélioration\n\n` +
-      `❌ Éliminatoires équipe :\n` +
-      `  • Absence non justifiée dans l'équipe\n` +
-      `  • Sanction disciplinaire membre\n` +
-      `  • Objectifs non atteints\n\n` +
-      `Pour consulter les données de présence d'un groupe :\n` +
-      `_Ex: résumé G-852_`;
-    await sock.sendMessage(jid, { text: msg });
-    return;
+  // ── NLP Pipeline ──────────────────────────────────────────────
+  const dateInfo  = detectDate(n);
+  const filters   = detectFilters(n);
+  let   metricDef = mapMetricToColumn(n);
+  const intent    = detectIntent(n, metricDef);
+
+  // Si process détecté mais aucune métrique → override intelligent
+  if (filters.activite && !metricDef) {
+    const askNombre = /nombre|effectif|combien|nbre|how\s*many|عدد|كم/.test(n);
+    metricDef = askNombre ? PROCESS_EFFECTIF : PROCESS_DEFAULT;
+    console.log(`   🔄 Process override → ${metricDef.metric}`);
   }
 
-  // ── Comparaison deux dates ─────────────────────────────────────
+  // Si toujours pas de métrique → demander une précision
+  if (!metricDef) {
+    const available = `NP, P, Total Abs, Actif, Présents, Taux NP, Taux P, Taux Présence, ` +
+      `Soll, IST, Delta, H.Présence, H.Sup, ML, MD, SQ, AC, RV, Retard, Résumé`;
+    const scopeDesc = buildScopeLabel(filters);
+    await sock.sendMessage(jid, { text:
+      `❓ Je n'ai pas compris l'indicateur demandé pour *${scopeDesc}*.\n\n` +
+      `📊 Indicateurs disponibles :\n${available}\n\n` +
+      `Exemples :\n` +
+      `• "Absence NP pour PGTF"\n• "Résumé G-856"\n• "Delta PGTF"\n• "Actif Shelf"`
+    }); return;
+  }
+
+  // DEBUG
+  console.log(`   📊 Intent: ${intent} | Metric: ${metricDef.metric} | Lang: ${lang}`);
+  console.log(`   🔍 Filtres: groupe=${filters.group||'—'} circuit=${filters.circuit||'—'} activite=${filters.activite||'—'} area=${filters.area||'—'}`);
+  console.log(`   📅 Date: ${dateInfo.mode}${dateInfo.date?' ('+dateInfo.date+')':''}`);
+
+  // ── Comparaison deux dates ────────────────────────────────────
   if (intent === 'compare') {
-    const twoDates = detectTwoDates(t);
-    const scopeLabel = scope.type === 'process' ? scope.value.toUpperCase()
-                     : scope.type === 'circuit' ? scope.value.toUpperCase()
-                     : scope.value;
+    const twoDates = detectTwoDates(n);
+    const scopeLabel = buildScopeLabel(filters);
+    const makeNlp = (dateMode, dateVal) => ({ ...filters, dateMode, dateVal });
+
     if (twoDates) {
-      const nlp1 = { metric, intent:'get_metric', language:lang, scope_type:scope.type, scope_value:scope.value, scope_process:scope.process, scope_circuit:scope.circuit, date_mode:'specific', date:twoDates.date1 };
-      const nlp2 = { metric, intent:'get_metric', language:lang, scope_type:scope.type, scope_value:scope.value, scope_process:scope.process, scope_circuit:scope.circuit, date_mode:'specific', date:twoDates.date2 };
-      const [rows1, rows2] = await Promise.all([dbQuery(buildSQL(nlp1)), dbQuery(buildSQL(nlp2))]);
-      const response = formatComparison(rows1, rows2, twoDates, metric, scopeLabel, lang);
+      const sql1 = buildDynamicSQL(filters, metricDef, 'get_metric', 'specific', twoDates.date1);
+      const sql2 = buildDynamicSQL(filters, metricDef, 'get_metric', 'specific', twoDates.date2);
+      const [r1, r2] = await Promise.all([dbQuery(sql1), dbQuery(sql2)]);
+      const response = formatComparison(r1, r2, twoDates, metricDef, scopeLabel, lang);
       await sock.sendMessage(jid, { text: response });
-      console.log(`   ✅ Comparaison envoyée`);
-      return;
     } else {
-      // Comparer dernière date vs avant-dernière
       const datesRows = await dbQuery(`SELECT DISTINCT report_date FROM daily_hr_report WHERE plant ILIKE 'BMW U11' ORDER BY report_date DESC LIMIT 2`);
       if (datesRows.length >= 2) {
         const d1 = datesRows[1].report_date.toISOString().slice(0,10);
         const d2 = datesRows[0].report_date.toISOString().slice(0,10);
-        const nlp1 = { metric, intent:'get_metric', language:lang, scope_type:scope.type, scope_value:scope.value, scope_process:scope.process, scope_circuit:scope.circuit, date_mode:'specific', date:d1 };
-        const nlp2 = { metric, intent:'get_metric', language:lang, scope_type:scope.type, scope_value:scope.value, scope_process:scope.process, scope_circuit:scope.circuit, date_mode:'specific', date:d2 };
-        const [rows1, rows2] = await Promise.all([dbQuery(buildSQL(nlp1)), dbQuery(buildSQL(nlp2))]);
-        const response = formatComparison(rows1, rows2, { date1:d1, date2:d2 }, metric, scopeLabel, lang);
+        const sql1 = buildDynamicSQL(filters, metricDef, 'get_metric', 'specific', d1);
+        const sql2 = buildDynamicSQL(filters, metricDef, 'get_metric', 'specific', d2);
+        const [r1, r2] = await Promise.all([dbQuery(sql1), dbQuery(sql2)]);
+        const response = formatComparison(r1, r2, {date1:d1,date2:d2}, metricDef, scopeLabel, lang);
         await sock.sendMessage(jid, { text: response });
-        console.log(`   ✅ Comparaison J/J-1 envoyée`);
-        return;
       }
     }
+    console.log(`   ✅ Comparaison envoyée`);
+    return;
   }
 
-  const nlp = { metric, intent, language: lang, scope_type: scope.type, scope_value: scope.value, scope_process: scope.process||null, scope_circuit: scope.circuit||null, date_mode: date.mode, date: date.date };
-  nlp.scope_label = scope.type === 'circuit' ? scope.value
-                  : scope.type === 'area' ? scope.value.replace(/%/g,'').trim()
-                  : scope.value;
+  // ── Requête principale ────────────────────────────────────────
+  const sql  = buildDynamicSQL(filters, metricDef, intent, dateInfo.mode, dateInfo.date);
+  console.log(`   🗄️ SQL: ${sql.replace(/\s+/g,' ').substring(0,150)}...`);
 
-  // SQL + réponse
-  const sql  = buildSQL(nlp);
   const rows = await dbQuery(sql);
   console.log(`   📋 ${rows.length} ligne(s) trouvée(s)`);
 
   let response;
-  if (['list_group','list_area','list_circuit'].includes(intent)) {
-    response = formatList(rows, nlp);
+  if (['list_group','list_area','list_circuit','top'].includes(intent)) {
+    response = formatList(rows, metricDef, intent, lang);
   } else {
-    response = formatResponse(rows, nlp);
+    response = formatAnswer(rows, filters, metricDef, intent, lang, null);
   }
+
   await sock.sendMessage(jid, { text: response });
   console.log(`   ✅ Réponse envoyée`);
 }
-
 // ── Bot Baileys ──────────────────────────────────────────────────
 async function startBot() {
   const { state, saveCreds } = USE_NEON_AUTH
