@@ -261,7 +261,7 @@ function buildSQL(nlp) {
     mise_en_demeure: 'SUM(md) AS mise_en_demeure',
     abs_np_rate: 'SUM(np) AS np, SUM(actif) AS actif, ROUND(SUM(np)/NULLIF(SUM(actif),0)*100,2) AS abs_np_rate',
     abs_p_rate: 'SUM(p) AS p, SUM(actif) AS actif, ROUND(SUM(p)/NULLIF(SUM(actif),0)*100,2) AS abs_p_rate',
-    total_abs: 'SUM(total_abs) AS total_abs, SUM(p) AS p, SUM(np) AS np',
+    total_abs: 'SUM(total_abs) AS total_abs, SUM(p) AS p, SUM(np) AS np, SUM(actif) AS actif',
     taux_presence: 'SUM(present) AS present, SUM(actif) AS actif, ROUND(SUM(present)/NULLIF(SUM(actif),0)*100,2) AS taux_presence',
     heures_sup: 'SUM(heures_sup) AS heures_sup',
     heures_presence: 'SUM(heures_presence) AS heures_presence, SUM(actif) AS actif',
@@ -367,17 +367,42 @@ function formatComparison(rows1, rows2, dates, metric, scope, lang) {
     present:'Présents', heures_sup:'H.Sup', retard:'Retard', heures_presence:'H.Présence'
   }[metric] || metric.toUpperCase();
 
+  // Compute percentage rates for count metrics (total_abs, np, p, etc.)
+  const getPct = (a, m) => {
+    if (!a || !a.actif) return null;
+    if (m === 'total_abs') return Math.round(((a.total_abs||0) / a.actif) * 10000) / 100;
+    if (m === 'np')       return Math.round(((a.np||0)        / a.actif) * 10000) / 100;
+    if (m === 'p')        return Math.round(((a.p||0)         / a.actif) * 10000) / 100;
+    if (m === 'present')  return Math.round(((a.present||0)   / a.actif) * 10000) / 100;
+    return null;
+  };
+  const pct1 = !isPct ? getPct(a1, metric) : null;
+  const pct2 = !isPct ? getPct(a2, metric) : null;
+  const pctDiff = (pct1 != null && pct2 != null) ? Math.round((pct2 - pct1) * 100) / 100 : null;
+
+  const actif1 = a1?.actif || 0;
+  const actif2 = a2?.actif || 0;
+
+  const v1Str = v1 != null ? fmt(v1) + unit : 'N/D';
+  const v2Str = v2 != null ? fmt(v2) + unit : 'N/D';
+  const pct1Str = pct1 != null ? ` (${fmt(pct1)}%)` : '';
+  const pct2Str = pct2 != null ? ` (${fmt(pct2)}%)` : '';
+  const evolStr = diff != null ? sign + fmt(diff) + unit : 'N/D';
+  const evolPctStr = pctDiff != null ? ` (${pctDiff >= 0 ? '+' : ''}${fmt(pctDiff)}%)` : '';
+  const actifStr = (actif1 > 0 || actif2 > 0)
+    ? `\n👥 Actif : ${fmt(actif1,0)} → ${fmt(actif2,0)}`
+    : '';
+
   if (lang === 'ar') {
-    return `📊 *مقارنة — ${scope}*\n\n` +
-      `📅 ${d1} → ${v1 != null ? fmt(v1) + unit : 'N/D'}\n` +
-      `📅 ${d2} → ${v2 != null ? fmt(v2) + unit : 'N/D'}\n\n` +
-      `${arrow} ${diff != null ? sign + fmt(diff) + unit : 'N/D'}`;
+    return `📊 *مقارنة ${metricLabel} — ${scope}*\n\n` +
+      `📅 ${d1} : *${v1Str}*${pct1Str}\n` +
+      `📅 ${d2} : *${v2Str}*${pct2Str}\n\n` +
+      `${arrow} ${evolStr}${evolPctStr}${actifStr}`;
   }
   return `📊 *Comparaison ${metricLabel} — ${scope}*\n\n` +
-    `📅 ${d1} : *${v1 != null ? fmt(v1) + unit : 'N/D'}*\n` +
-    `📅 ${d2} : *${v2 != null ? fmt(v2) + unit : 'N/D'}*\n\n` +
-    `${arrow} Évolution : ${diff != null ? sign + fmt(diff) + unit : 'N/D'}` +
-    (a1 ? `\n👥 Actif : ${fmt(a1.actif||0,0)} → ${fmt(a2?.actif||0,0)}` : '');
+    `📅 ${d1} : *${v1Str}*${pct1Str}\n` +
+    `📅 ${d2} : *${v2Str}*${pct2Str}\n\n` +
+    `${arrow} Évolution : ${evolStr}${evolPctStr}${actifStr}`;
 }
 
 function formatResponse(rows, nlp) {
@@ -437,13 +462,13 @@ function formatResponse(rows, nlp) {
     ac:{fr:`📋 *AC — ${scope}*\n📅 ${dl}\n\n🔁 AC = ${fmt(agg.ac,0)}`,ar:`📋 *AC*\n📅 ${dl}\n\nAC = ${fmt(agg.ac,0)}`,tn:`📋 *AC*\n📅 ${dl}\n\nAC = ${fmt(agg.ac,0)}`},
     rv:{fr:`📋 *RV — Renvoi — ${scope}*\n📅 ${dl}\n\n📌 RV (Renvoi) = ${fmt(agg.rv,0)}`,ar:`📋 *RV — رفض*\n📅 ${dl}\n\nRV = ${fmt(agg.rv,0)}`,tn:`📋 *RV (Renvoi)*\n📅 ${dl}\n\nRV = ${fmt(agg.rv,0)}`},
     maladie:{
-      fr:`🏥 *ML — Maladie Prolongée — ${scope}*\n📅 ${dl}\n\n🤒 ML (Maladie Prolongée) = ${fmt(agg.maladie,0)}\n\n⚠️ _ML ≠ MD : ML = maladie prolongée SEULEMENT\nMD = mise en demeure (quittement) — indicateur séparé_`,
-      ar:`🏥 *ML — مرض طويل الأمد — ${scope}*\n📅 ${dl}\n\n🤒 ML = ${fmt(agg.maladie,0)}\n_(ML = مرض فقط — MD = إنهاء عقد، مؤشر منفصل)_`,
-      tn:`🏥 *ML — Maladie Prolongée — ${scope}*\n📅 ${dl}\n\nML = ${fmt(agg.maladie,0)}\n_(ML ≠ MD: ML = maladie, MD = quittement)_`},
+      fr:`🏥 *ML — Maladie Prolongée — ${scope}*\n📅 ${dl}\n\n🤒 ML (Maladie Prolongée) = ${fmt(agg.maladie,0)}`,
+      ar:`🏥 *ML — مرض طويل الأمد — ${scope}*\n📅 ${dl}\n\n🤒 ML (Maladie Prolongée) = ${fmt(agg.maladie,0)}`,
+      tn:`🏥 *ML — Maladie Prolongée — ${scope}*\n📅 ${dl}\n\nML = ${fmt(agg.maladie,0)}`},
     mise_en_demeure:{
-      fr:`⚠️ *MD — Mise en demeure (Fluctuation) — ${scope}*\n📅 ${dl}\n\n🚪 MD (Mise en demeure / Fluctuation) = ${fmt(agg.mise_en_demeure,0)}\n\n⚠️ _MD ≠ ML : MD = quittement SEULEMENT\nML = maladie prolongée — indicateur séparé_`,
-      ar:`⚠️ *MD — إنهاء عقد / إنذار — ${scope}*\n📅 ${dl}\n\n🚪 MD = ${fmt(agg.mise_en_demeure,0)}\n_(MD = إنهاء عقد فقط — ML = مرض، مؤشر منفصل)_`,
-      tn:`⚠️ *MD — Mise en demeure — ${scope}*\n📅 ${dl}\n\nMD = ${fmt(agg.mise_en_demeure,0)}\n_(MD ≠ ML: MD = quittement, ML = maladie)_`},
+      fr:`⚠️ *MD — Mise en demeure (Fluctuation) — ${scope}*\n📅 ${dl}\n\n🚪 MD (Mise en demeure / Fluctuation) = ${fmt(agg.mise_en_demeure,0)}`,
+      ar:`⚠️ *MD — إنذار (Fluctuation) — ${scope}*\n📅 ${dl}\n\n🚪 MD = ${fmt(agg.mise_en_demeure,0)}`,
+      tn:`⚠️ *MD — Mise en demeure (Fluctuation) — ${scope}*\n📅 ${dl}\n\nMD = ${fmt(agg.mise_en_demeure,0)}`},
     abs_np_rate:{fr:`📊 *Taux NP — ${scope}*\n📅 ${dl}\n\n📉 Taux NP = ${fmt(agg.abs_np_rate)}%\n   NP = ${fmt(agg.np,0)} / Actif = ${fmt(agg.actif,0)}`,ar:`📊 *نسبة NP*\n📅 ${dl}\n\n📉 ${fmt(agg.abs_np_rate)}%`,tn:`📊 *Taux NP*\n📅 ${dl}\n\n📉 ${fmt(agg.abs_np_rate)}% (NP=${fmt(agg.np,0)})`},
     abs_p_rate:{fr:`📊 *Taux P — ${scope}*\n📅 ${dl}\n\n📉 Taux P = ${fmt(agg.abs_p_rate)}%\n   P = ${fmt(agg.p,0)} / Actif = ${fmt(agg.actif,0)}`,ar:`📊 *نسبة P*\n📅 ${dl}\n\n📉 ${fmt(agg.abs_p_rate)}%`,tn:`📊 *Taux P*\n📅 ${dl}\n\n📉 ${fmt(agg.abs_p_rate)}%`},
     total_abs:{fr:`📊 *Total Absences — ${scope}*\n📅 ${dl}\n\n👥 Actif : ${fmt(agg.actif,0)}\n❌ NP : ${fmt(agg.np,0)} | 🗓️ P : ${fmt(agg.p,0)}\n📊 Total Abs = ${fmt(agg.total_abs,0)}`,ar:`📊 *إجمالي الغيابات*\n📅 ${dl}\n\nNP=${fmt(agg.np,0)} | P=${fmt(agg.p,0)} | Total=${fmt(agg.total_abs,0)}`,tn:`📊 *Total Abs*\n📅 ${dl}\n\nNP=${fmt(agg.np,0)} | P=${fmt(agg.p,0)} | Total=${fmt(agg.total_abs,0)}`},
